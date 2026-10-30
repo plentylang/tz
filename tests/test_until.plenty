@@ -1,0 +1,160 @@
+# Zoned.until and Zoned.since: disambiguation of the intermediate reading,
+# the cases where this package deliberately differs from jiff, zone
+# mismatches, and range limits. test_until_jiff.plenty checks agreement
+# with jiff on ordinary cases.
+import std.test
+import tz
+from std.fmt import FormatError
+
+type Problem = std.test.TestError | AllocError | FormatError | tz.TzError
+
+def fields(span: &tz.Span) -> (i64, i64, i64, i64, i64, i64, i64, i64):
+    (span.years(), span.months(), span.weeks(), span.days(), span.hours(), span.minutes(), span.seconds(), span.nanoseconds())
+
+def zoned(text: &str) -> Result[tz.Zoned, Problem]:
+    Ok(tz.parse_zoned(text)?)
+
+def error_of[T](result: &Result[T, tz.TzError]) -> Option[tz.TzError]:
+    match result:
+        case Ok(_):
+            Nothing
+        case Err(error):
+            Some(*error)
+
+def difference(start: &str, end: &str, largest: tz.Unit, how: tz.Disambiguation) -> Result[(i64, i64, i64, i64, i64, i64, i64, i64), Problem]:
+    first = zoned(start)?
+    second = zoned(end)?
+    span = first.until(&second, largest, how)?
+    # The contract: adding the result back with the same disambiguation
+    # gives the end value.
+    back = first.checked_add(&span, how)?
+    std.test.equal(&back.compare(&second), &0)?
+    std.test.equal(&back.to_string()?, &second.to_string()?)?
+    Ok(fields(&span))
+
+def until_error(start: &str, end: &str, largest: tz.Unit, how: tz.Disambiguation) -> Result[Option[tz.TzError], Problem]:
+    first = zoned(start)?
+    second = zoned(end)?
+    Ok(error_of(&first.until(&second, largest, how)))
+
+def test_gap_intermediate() -> Result[(), Problem]:
+    # One day after 2024-03-09T02:30 is 02:30 on 10 March, which New York
+    # skips.
+    start = "2024-03-09T02:30:00-05:00[America/New_York]"
+    end = "2024-03-10T03:45:00-04:00[America/New_York]"
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Compatible)?, &(0, 0, 0, 1, 0, 15, 0, 0))?
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Later)?, &(0, 0, 0, 1, 0, 15, 0, 0))?
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Earlier)?, &(0, 0, 0, 1, 1, 15, 0, 0))?
+    std.test.equal(&until_error(&start, &end, tz.Unit.Day, tz.Disambiguation.Reject)?, &Some(tz.TzError.Gap))?
+    # Exact units never resolve a reading.
+    std.test.equal(&difference(&start, &end, tz.Unit.Hour, tz.Disambiguation.Reject)?, &(0, 0, 0, 0, 24, 15, 0, 0))?
+    Ok(())
+
+def test_fold_intermediate() -> Result[(), Problem]:
+    # 01:30 on 3 November happens twice in New York.
+    start = "2024-11-02T01:30:00-04:00[America/New_York]"
+    end = "2024-11-03T01:45:00-05:00[America/New_York]"
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Compatible)?, &(0, 0, 0, 1, 1, 15, 0, 0))?
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Earlier)?, &(0, 0, 0, 1, 1, 15, 0, 0))?
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Later)?, &(0, 0, 0, 1, 0, 15, 0, 0))?
+    std.test.equal(&until_error(&start, &end, tz.Unit.Day, tz.Disambiguation.Reject)?, &Some(tz.TzError.Fold))?
+    Ok(())
+
+def test_same_date_in_a_fold() -> Result[(), Problem]:
+    # Both values are in the repeated hour, ten minutes apart. jiff 0.2
+    # resolves 01:30 again, to the first 01:30, and reports 1 hour 10
+    # minutes, which checked_add does not undo. With no calendar units this
+    # package measures from the start instant itself.
+    start = "2024-11-03T01:30:00-05:00[America/New_York]"
+    end = "2024-11-03T01:40:00-05:00[America/New_York]"
+    std.test.equal(&difference(&start, &end, tz.Unit.Year, tz.Disambiguation.Compatible)?, &(0, 0, 0, 0, 0, 10, 0, 0))?
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Reject)?, &(0, 0, 0, 0, 0, 10, 0, 0))?
+    # Backwards, jiff 0.2 panics ("this should be an error").
+    std.test.equal(&difference(&end, &start, tz.Unit.Year, tz.Disambiguation.Compatible)?, &(0, 0, 0, 0, 0, -10, 0, 0))?
+    earlier = "2024-11-03T01:10:00-05:00[America/New_York]"
+    std.test.equal(&difference(&start, &earlier, tz.Unit.Day, tz.Disambiguation.Compatible)?, &(0, 0, 0, 0, 0, -20, 0, 0))?
+    Ok(())
+
+def test_intermediate_past_the_end() -> Result[(), Problem]:
+    # Going back a day from 4 November 01:30 reaches 01:30 on 3 November.
+    # Compatible resolves it to the first 01:30, before the end value, so
+    # the result counts no days and 24 hours 20 minutes instead; jiff 0.2
+    # panics. Later resolves it to the second 01:30, after the end.
+    start = "2024-11-04T01:30:00-05:00[America/New_York]"
+    end = "2024-11-03T01:10:00-05:00[America/New_York]"
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Compatible)?, &(0, 0, 0, 0, -24, -20, 0, 0))?
+    std.test.equal(&difference(&start, &end, tz.Unit.Day, tz.Disambiguation.Later)?, &(0, 0, 0, -1, 0, -20, 0, 0))?
+    Ok(())
+
+def test_month_end_and_leap_years() -> Result[(), Problem]:
+    how = tz.Disambiguation.Reject
+    # A month counts only when the start's day of the month fits before the
+    # end, as in jiff and Temporal.
+    std.test.equal(&difference(&"2024-01-31T09:00:00-05:00[America/New_York]", &"2024-02-29T09:00:00-05:00[America/New_York]", tz.Unit.Year, how)?, &(0, 0, 0, 29, 0, 0, 0, 0))?
+    std.test.equal(&difference(&"2024-01-31T09:00:00-05:00[America/New_York]", &"2024-03-01T09:00:00-05:00[America/New_York]", tz.Unit.Year, how)?, &(0, 1, 0, 1, 0, 0, 0, 0))?
+    std.test.equal(&difference(&"2024-03-31T09:00:00-04:00[America/New_York]", &"2024-02-29T09:00:00-05:00[America/New_York]", tz.Unit.Year, how)?, &(0, -1, 0, 0, 0, 0, 0, 0))?
+    std.test.equal(&difference(&"2024-02-29T09:00:00-05:00[America/New_York]", &"2025-02-28T09:00:00-05:00[America/New_York]", tz.Unit.Year, how)?, &(0, 11, 0, 30, 0, 0, 0, 0))?
+    std.test.equal(&difference(&"2024-02-29T09:00:00-05:00[America/New_York]", &"2028-02-29T09:00:00-05:00[America/New_York]", tz.Unit.Year, how)?, &(4, 0, 0, 0, 0, 0, 0, 0))?
+    std.test.equal(&difference(&"2024-02-29T09:00:00-05:00[America/New_York]", &"2028-02-29T09:00:00-05:00[America/New_York]", tz.Unit.Month, how)?, &(0, 48, 0, 0, 0, 0, 0, 0))?
+    std.test.equal(&difference(&"2024-02-29T09:00:00-05:00[America/New_York]", &"2028-02-29T09:00:00-05:00[America/New_York]", tz.Unit.Week, how)?, &(0, 0, 208, 5, 0, 0, 0, 0))?
+    Ok(())
+
+def test_since() -> Result[(), Problem]:
+    first = zoned(&"2024-03-31T00:00:00+00:00[UTC]")?
+    second = zoned(&"2024-02-29T00:00:00+00:00[UTC]")?
+    how = tz.Disambiguation.Reject
+    # since negates until from the same value, as in jiff, so it can differ
+    # from until in the other direction.
+    std.test.equal(&fields(&first.since(&second, tz.Unit.Year, how)?), &(0, 1, 0, 0, 0, 0, 0, 0))?
+    std.test.equal(&fields(&second.until(&first, tz.Unit.Year, how)?), &(0, 1, 0, 2, 0, 0, 0, 0))?
+    std.test.check(first.until(&first, tz.Unit.Year, how)?.is_zero(), "zero")?
+    Ok(())
+
+def test_zone_mismatch() -> Result[(), Problem]:
+    new_york = zoned(&"2024-03-09T09:30:00-05:00[America/New_York]")?
+    london = zoned(&"2024-03-16T13:30:00+00:00[Europe/London]")?
+    how = tz.Disambiguation.Compatible
+    std.test.equal(&error_of(&new_york.until(&london, tz.Unit.Day, how)), &Some(tz.TzError.ZoneMismatch))?
+    std.test.equal(&error_of(&new_york.since(&london, tz.Unit.Year, how)), &Some(tz.TzError.ZoneMismatch))?
+    # Exact units measure elapsed time between any zones.
+    std.test.equal(&fields(&new_york.until(&london, tz.Unit.Hour, how)?), &(0, 0, 0, 0, 167, 0, 0, 0))?
+    # Zones match by name and kind, as in jiff.
+    again = london.in_zone(&tz.zone("Europe/London")?)?
+    std.test.equal(&fields(&london.until(&again, tz.Unit.Day, how)?), &(0, 0, 0, 0, 0, 0, 0, 0))?
+    utc = london.in_zone(&tz.utc())?
+    named = london.in_zone(&tz.zone("UTC")?)?
+    fixed = london.in_zone(&tz.fixed(&tz.offset(0)?))?
+    std.test.equal(&error_of(&utc.until(&named, tz.Unit.Day, how)), &Some(tz.TzError.ZoneMismatch))?
+    std.test.equal(&error_of(&utc.until(&fixed, tz.Unit.Day, how)), &Some(tz.TzError.ZoneMismatch))?
+    kolkata = london.in_zone(&tz.zone("Asia/Kolkata")?)?
+    calcutta = london.in_zone(&tz.zone("Asia/Calcutta")?)?
+    std.test.equal(&error_of(&kolkata.until(&calcutta, tz.Unit.Day, how)), &Some(tz.TzError.ZoneMismatch))?
+    Ok(())
+
+def test_range_limits() -> Result[(), Problem]:
+    how = tz.Disambiguation.Reject
+    epoch = zoned(&"1970-01-01T00:00:00+00:00[UTC]")?
+    last = zoned(&"2262-04-11T23:47:16.854775807+00:00[UTC]")?
+    std.test.equal(&fields(&epoch.until(&last, tz.Unit.Nanosecond, how)?), &(0, 0, 0, 0, 0, 0, 0, i64.MAX))?
+    beyond = zoned(&"2262-04-11T23:47:16.854775808+00:00[UTC]")?
+    std.test.equal(&error_of(&epoch.until(&beyond, tz.Unit.Nanosecond, how)), &Some(tz.TzError.OutOfRange))?
+    first = zoned(&"1677-09-21T00:12:43.145224192+00:00[UTC]")?
+    std.test.equal(&fields(&epoch.until(&first, tz.Unit.Nanosecond, how)?), &(0, 0, 0, 0, 0, 0, 0, i64.MIN))?
+    # The widest supported range fits every other unit.
+    low = zoned(&"-009999-01-01T00:00:00+00:00[UTC]")?
+    high = zoned(&"9999-12-31T23:59:59.999999999+00:00[UTC]")?
+    std.test.equal(&error_of(&low.until(&high, tz.Unit.Nanosecond, how)), &Some(tz.TzError.OutOfRange))?
+    std.test.equal(&fields(&low.until(&high, tz.Unit.Second, how)?), &(0, 0, 0, 0, 0, 0, 631107417599, 999999999))?
+    std.test.equal(&fields(&low.until(&high, tz.Unit.Year, how)?), &(19998, 11, 0, 30, 23, 59, 59, 999999999))?
+    std.test.equal(&fields(&high.until(&low, tz.Unit.Week, how)?), &(0, 0, -1043497, -4, -23, -59, -59, -999999999))?
+    Ok(())
+
+def test_readme_example() -> Result[(), Problem]:
+    # The example under "Differences between zoned values" in README.md.
+    new_york = tz.zone("America/New_York")?
+    start = tz.datetime(2024, 1, 31, 9, 0)?.to_zoned(&new_york, tz.Disambiguation.Reject)?
+    end = tz.datetime(2025, 3, 10, 8, 30)?.to_zoned(&new_york, tz.Disambiguation.Reject)?
+    span = start.until(&end, tz.Unit.Year, tz.Disambiguation.Compatible)?
+    std.test.equal(&(span.years(), span.months(), span.days(), span.hours(), span.minutes()), &(1, 1, 9, 23, 30))?
+    std.test.equal(&start.until(&end, tz.Unit.Week, tz.Disambiguation.Compatible)?.weeks(), &57)?
+    Ok(())
