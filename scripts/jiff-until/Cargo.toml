@@ -1,0 +1,11 @@
+# Generates tests/test_until_jiff.plenty from jiff. See src/main.rs.
+[package]
+name = "jiff-until"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+jiff = "=0.2.31"

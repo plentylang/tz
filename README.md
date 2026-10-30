@@ -16,7 +16,7 @@ Add the dependency to `plenty.toml`, then run `plenty fetch`:
 
 ```toml
 [dependencies]
-tz = { git = "https://github.com/plentylang/tz.git", tag = "v0.2.0" }
+tz = { git = "https://github.com/plentylang/tz.git", tag = "v0.3.0" }
 ```
 
 It needs Plenty 0.7.1 or later.
@@ -65,7 +65,8 @@ All values are small `@copy` classes. Constructors and arithmetic return
 | `OffsetInfo` | Offset, DST flag, and abbreviation in force at an instant |
 | `LocalOffsets` | `Unique(offset)`, `Gap(before, after)`, or `Fold(before, after)` for a local time |
 | `Disambiguation` | `Compatible`, `Earlier`, `Later`, or `Reject` |
-| `TzError` | `InvalidDate`, `InvalidTime`, `InvalidOffset`, `OutOfRange`, `UnknownZone`, `Syntax`, `Gap`, `Fold`, `OffsetConflict`, `TimeUnitsOnDate` |
+| `Unit` | The largest unit of a difference: `Year`, `Month`, `Week`, `Day` (calendar), or `Hour`, `Minute`, `Second`, `Nanosecond` (exact) |
+| `TzError` | `InvalidDate`, `InvalidTime`, `InvalidOffset`, `OutOfRange`, `UnknownZone`, `Syntax`, `Gap`, `Fold`, `OffsetConflict`, `TimeUnitsOnDate`, `ZoneMismatch` |
 
 Constructors: `date`, `date_from_epoch_day`, `time`, `midnight`, `datetime`,
 `span` (keyword arguments, each defaulting to 0), `offset`, `offset_hours`,
@@ -116,8 +117,67 @@ Arithmetic follows jiff:
   result in the zone with the given `Disambiguation`, then adds exact time.
   So `span(days=1)` across a DST change keeps the wall-clock time, and
   `span(hours=24)` keeps the elapsed time.
-- `Date.until` returns years, months, and days; `Zoned.span_until` returns
-  exact units only.
+- `Date.until` returns years, months, and days. As in jiff and Temporal, a
+  month counts only when the start's day of the month, before clamping,
+  does not pass the end: `2024-01-31` to `2024-02-29` is 29 days, and to
+  `2024-03-01` is one month and one day.
+- `Zoned.span_until` returns exact units only.
+
+### Differences between zoned values
+
+`Zoned.until(other, largest, disambiguation)` returns the span to `other`
+in units no larger than `largest`, all with the sign of the difference.
+`Zoned.since` with the same arguments is its negation. Both return
+`Result[Span, TzError]`.
+
+```python
+import tz
+
+def main() -> Result[(), tz.TzError | AllocError | IoError]:
+    new_york = tz.zone("America/New_York")?
+    start = tz.datetime(2024, 1, 31, 9, 0)?.to_zoned(&new_york, tz.Disambiguation.Reject)?
+    end = tz.datetime(2025, 3, 10, 8, 30)?.to_zoned(&new_york, tz.Disambiguation.Reject)?
+    span = start.until(&end, tz.Unit.Year, tz.Disambiguation.Compatible)?
+    print(span.years(), span.months(), span.days(), span.hours(), span.minutes())?
+    print(start.until(&end, tz.Unit.Week, tz.Disambiguation.Compatible)?.weeks())?
+    Ok(())
+```
+
+```text
+1 1 9 23 30
+57
+```
+
+The end's time of day is before the start's, so the calendar units run to
+9 March. 13 months from 31 January is 28 February 2025, after clamping, and
+9 days more is 9 March; 9 March 09:00 to 10 March 08:30 is 23 hours 30
+minutes. `tests/test_until.plenty` checks this output.
+
+The semantics are jiff's `Zoned::until`:
+
+- With `Hour` or a smaller unit, the result is exact elapsed time, and the
+  values may be in any zones. `Nanosecond` is `OutOfRange` beyond about 292
+  years.
+- With a calendar unit, both values must be in the same zone, or the result
+  is `ZoneMismatch`. Zones are the same when they have the same name and
+  kind, so a link and its target differ, as do `utc()` and `zone("UTC")`.
+- Years, months, weeks, and days are counted on the wall clock, from this
+  value's date to an intermediate date: the end date, or the day before it
+  (after it, when going backwards) if the end's time of day is earlier
+  than the start's. That date at the start's time of day is resolved in
+  the zone with `disambiguation`, and the remainder is exact elapsed time
+  in hours and smaller units. If a transition puts the resolved instant
+  past the end, the intermediate date moves another day towards the
+  start.
+- `start.checked_add(&span, disambiguation)` is `end`.
+
+Two cases differ from jiff 0.2, which re-resolves the start's own wall-clock
+reading: when the intermediate date is the start's date, this package uses
+the start instant itself, so ten minutes inside a fold is ten minutes, not
+jiff's one hour ten; and where jiff panics because the resolved reading
+passes the end of a backwards difference, this package moves the
+intermediate date as described. jiff always resolves with `Compatible`.
+Rounding options are not provided.
 
 `Disambiguation` resolves a local time that a gap skips or a fold repeats:
 
@@ -151,8 +211,8 @@ Text:
 zone and link name, newline-separated and sorted.
 
 Not included: leap seconds, locale-aware formatting, `strftime`-style
-patterns, non-Gregorian calendars, POSIX `TZ` strings as input, and spans
-rounded or balanced into larger units.
+patterns, non-Gregorian calendars, POSIX `TZ` strings as input, rounding spans,
+and balancing an existing span into larger units.
 
 ## Data
 
@@ -220,7 +280,19 @@ plenty test
 
 The tests cover the conformance vectors, named DST cases (New York, London,
 Lord Howe's 30-minute shift, Apia skipping 30 December 2011, local mean
-time), calendar arithmetic, range limits, and the RFC 3339 examples.
+time), calendar arithmetic, differences between zoned values, range
+limits, and the RFC 3339 examples.
+
+`tests/test_until_jiff.plenty` checks `Zoned.until` and `Zoned.since`
+against jiff on 23 pairs of values, in both directions and every unit. It
+is generated by `scripts/jiff-until`:
+
+```sh
+cargo run --manifest-path scripts/jiff-until/Cargo.toml > tests/test_until_jiff.plenty
+```
+
+jiff reads the system's zone files, so check that they agree with the
+bundled data for the zones in the script before regenerating.
 
 ## Licence
 

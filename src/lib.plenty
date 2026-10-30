@@ -45,6 +45,8 @@ pub enum TzError:
     OffsetConflict
     # A span with hours or smaller units added to a Date.
     TimeUnitsOnDate
+    # Calendar units between Zoned values in different time zones.
+    ZoneMismatch
 
     pub def display[W](self, out: &mut Formatter[W]) -> Result[(), FormatError]:
         match self:
@@ -68,6 +70,8 @@ pub enum TzError:
                 out.text("offset does not match the time zone")
             case TzError.TimeUnitsOnDate:
                 out.text("a date cannot add hours or smaller units")
+            case TzError.ZoneMismatch:
+                out.text("calendar units between different time zones")
 
 # How to choose an instant for a local time that a zone transition skips
 # (a gap) or repeats (a fold). Unambiguous local times ignore it.
@@ -83,6 +87,25 @@ pub enum Disambiguation:
     Later
     # Err(TzError.Gap) or Err(TzError.Fold).
     Reject
+
+# The largest unit of a difference from Zoned.until or Zoned.since.
+# Year to Day are calendar units; Hour and smaller are exact units.
+pub enum Unit:
+    Year
+    Month
+    Week
+    Day
+    Hour
+    Minute
+    Second
+    Nanosecond
+
+    pub def is_calendar(self) -> bool:
+        match self:
+            case Unit.Year | Unit.Month | Unit.Week | Unit.Day:
+                True
+            case _:
+                False
 
 pub enum Weekday:
     Monday
@@ -214,19 +237,18 @@ pub class Date:
 
     # The years, months, and days from this date to `other`, all with the
     # sign of the difference, such that checked_add of the result from this
-    # date gives `other`.
+    # date gives `other`. As in jiff and Temporal, a month counts only when
+    # this day of the month, before clamping, does not pass `other`: from
+    # 2024-01-31 to 2024-02-29 is 29 days, not one month.
     pub def until(self, other: &Date) -> Result[Span, TzError]:
         mut months = (other.year() - self.year()) * 12 + other.month() - self.month()
-        mut candidate = months_added(self, months)?
         if other.epoch_day() >= self.epoch_day():
-            if candidate.epoch_day() > other.epoch_day():
+            if months != 0 and self.day() > other.day():
                 months -= 1
-                candidate = months_added(self, months)?
-        elif candidate.epoch_day() < other.epoch_day():
+        elif months != 0 and self.day() < other.day():
             months += 1
-            candidate = months_added(self, months)?
-        # Truncating division keeps years and months on the same side of zero.
-        years = months // 12 if months >= 0 else -(-months // 12)
+        candidate = months_added(self, months)?
+        years = truncated(months, 12)
         Ok(Span(years, months - years * 12, 0, other.epoch_day() - candidate.epoch_day(), 0, 0, 0, 0))
 
     pub def days_until(self, other: &Date) -> i64:
@@ -929,17 +951,58 @@ pub class Zoned:
     # The exact elapsed time to `other` in hours, minutes, seconds, and
     # nanoseconds, all with the sign of the difference.
     pub def span_until(self, other: &Zoned) -> Span:
-        mut seconds = other._seconds - self._seconds
-        mut nanos = i64(other._nanosecond) - i64(self._nanosecond)
-        if seconds > 0 and nanos < 0:
-            seconds -= 1
-            nanos += NANOS_PER_SECOND
-        elif seconds < 0 and nanos > 0:
-            seconds += 1
-            nanos -= NANOS_PER_SECOND
-        sign = -1 if seconds < 0 else 1
-        magnitude = seconds * sign
-        Span(0, 0, 0, 0, sign * (magnitude // 3600), sign * (magnitude // 60 % 60), sign * (magnitude % 60), nanos)
+        elapsed(self._seconds, self._nanosecond, other._seconds, other._nanosecond)
+
+    # The span from this instant to `other`, in units no larger than
+    # `largest`, all with the sign of the difference. Exact units measure
+    # elapsed time, in any zones. Calendar units need both values in the same
+    # zone (else ZoneMismatch): years to days are counted on the wall clock,
+    # and the rest is elapsed time in hours and smaller units.
+    # `disambiguation` resolves the intermediate wall-clock reading (the end
+    # date at this value's time of day) where it falls in a gap or fold.
+    # checked_add of the result to this value, with the same
+    # `disambiguation`, gives `other`.
+    pub def until(self, other: &Zoned, largest: Unit, disambiguation: Disambiguation) -> Result[Span, TzError]:
+        if not largest.is_calendar():
+            return exact_span(self._seconds, self._nanosecond, other._seconds, other._nanosecond, largest)
+        if not same_zone(&self._zone, &other._zone):
+            return Err(TzError.ZoneMismatch)
+        sign = other.compare(self)
+        if sign == 0:
+            return Ok(span())
+        start = self._datetime
+        end = other._datetime
+        first_day = start._date.epoch_day()
+        # Step back a day from the end date when the end's time of day is
+        # before the start's, so that the elapsed remainder keeps the sign.
+        mut correction = 1 if start._time.compare(&end._time) == sign else 0
+        mut middle_date = start._date
+        mut middle_seconds = self._seconds
+        while True:
+            day = end._date.epoch_day() - correction * sign
+            # At the start date there are no calendar units, and checked_add
+            # adds the elapsed time to this instant without resolving it.
+            if compared(day, first_day) != sign:
+                break
+            candidate = date_from_epoch_day(day)?
+            seconds = resolved(&self._zone, &DateTime(candidate, start._time), disambiguation)?
+            # A transition can resolve the reading past `other`; then the
+            # intermediate date moves another day towards the start.
+            if instant_order(other._seconds, other._nanosecond, seconds, self._nanosecond) != -sign:
+                middle_date = candidate
+                middle_seconds = seconds
+                break
+            correction += 1
+        dates = date_difference(&start._date, &middle_date, largest)?
+        rest = elapsed(middle_seconds, self._nanosecond, other._seconds, other._nanosecond)
+        Ok(Span(dates._years, dates._months, dates._weeks, dates._days, rest._hours, rest._minutes, rest._seconds, rest._nanoseconds))
+
+    # The span from `other` to this instant. As in jiff, it is the negation
+    # of `self.until(other, ...)`, so calendar units are counted from this
+    # value: `a.since(&b, ...)` can differ from `b.until(&a, ...)`.
+    pub def since(self, other: &Zoned, largest: Unit, disambiguation: Disambiguation) -> Result[Span, TzError]:
+        forward = self.until(other, largest, disambiguation)?
+        Ok(Span(-forward._years, -forward._months, -forward._weeks, -forward._days, -forward._hours, -forward._minutes, -forward._seconds, -forward._nanoseconds))
 
     # Orders by instant; zones are not compared.
     pub def compare(self, other: &Zoned) -> i64:
@@ -960,6 +1023,79 @@ pub class Zoned:
 
     pub def to_string(self) -> Result[str, FormatError]:
         f"{self}"
+
+# Zones are the same when they have the same name and data, as in jiff:
+# utc(), fixed(offset(0)), and zone("UTC") are three different zones, and
+# so are a link and its target.
+def same_zone(left: &TimeZone, right: &TimeZone) -> bool:
+    left._name == right._name and left._fixed == right._fixed and len(left._data) == len(right._data)
+
+def instant_order(seconds: i64, nanosecond: u32, other_seconds: i64, other_nanosecond: u32) -> i64:
+    by_second = compared(seconds, other_seconds)
+    if by_second != 0:
+        by_second
+    else:
+        compared(i64(nanosecond), i64(other_nanosecond))
+
+# Division rounding towards zero, so quotient and remainder share a sign.
+def truncated(value: i64, divisor: i64) -> i64:
+    value // divisor if value >= 0 else -(-value // divisor)
+
+# The difference from one instant to another as whole seconds and
+# nanoseconds with the same sign.
+def seconds_between(seconds: i64, nanosecond: u32, other_seconds: i64, other_nanosecond: u32) -> (i64, i64):
+    mut whole = other_seconds - seconds
+    mut nanos = i64(other_nanosecond) - i64(nanosecond)
+    if whole > 0 and nanos < 0:
+        whole -= 1
+        nanos += NANOS_PER_SECOND
+    elif whole < 0 and nanos > 0:
+        whole += 1
+        nanos -= NANOS_PER_SECOND
+    (whole, nanos)
+
+def elapsed(seconds: i64, nanosecond: u32, other_seconds: i64, other_nanosecond: u32) -> Span:
+    (whole, nanos) = seconds_between(seconds, nanosecond, other_seconds, other_nanosecond)
+    hours = truncated(whole, 3600)
+    minutes = truncated(whole - hours * 3600, 60)
+    Span(0, 0, 0, 0, hours, minutes, whole - hours * 3600 - minutes * 60, nanos)
+
+# Instants are at most about 20,000 years apart, which fits every unit but
+# nanoseconds: those are OutOfRange beyond i64, about 292 years.
+def exact_span(seconds: i64, nanosecond: u32, other_seconds: i64, other_nanosecond: u32, largest: Unit) -> Result[Span, TzError]:
+    (whole, nanos) = seconds_between(seconds, nanosecond, other_seconds, other_nanosecond)
+    match largest:
+        case Unit.Minute:
+            minutes = truncated(whole, 60)
+            Ok(Span(0, 0, 0, 0, 0, minutes, whole - minutes * 60, nanos))
+        case Unit.Second:
+            Ok(Span(0, 0, 0, 0, 0, 0, whole, nanos))
+        case Unit.Nanosecond:
+            limit = i64.MAX // NANOS_PER_SECOND
+            if whole > limit or whole < -limit:
+                return Err(TzError.OutOfRange)
+            scaled = whole * NANOS_PER_SECOND
+            if (nanos > 0 and scaled > i64.MAX - nanos) or (nanos < 0 and scaled < i64.MIN - nanos):
+                return Err(TzError.OutOfRange)
+            Ok(Span(0, 0, 0, 0, 0, 0, 0, scaled + nanos))
+        case _:
+            Ok(elapsed(seconds, nanosecond, other_seconds, other_nanosecond))
+
+# Date.until in units no larger than `largest`, a calendar unit. Weeks are
+# whole multiples of seven days.
+def date_difference(start: &Date, end: &Date, largest: Unit) -> Result[Span, TzError]:
+    days = end.epoch_day() - start.epoch_day()
+    match largest:
+        case Unit.Year:
+            start.until(end)
+        case Unit.Month:
+            dates = start.until(end)?
+            Ok(Span(0, dates._years * 12 + dates._months, 0, dates._days, 0, 0, 0, 0))
+        case Unit.Week:
+            weeks = truncated(days, 7)
+            Ok(Span(0, 0, weeks, days - weeks * 7, 0, 0, 0, 0))
+        case _:
+            Ok(Span(0, 0, 0, days, 0, 0, 0, 0))
 
 def zoned_at(seconds: i64, nanosecond: u32, zone: &TimeZone) -> Result[Zoned, TzError]:
     if seconds < MIN_INSTANT or seconds > MAX_INSTANT or i64(nanosecond) >= NANOS_PER_SECOND:

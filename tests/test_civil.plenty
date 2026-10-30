@@ -50,6 +50,9 @@ def test_until() -> Result[(), Problem]:
     back = end.until(&start)?
     std.test.equal(&(back.years(), back.months(), back.days()), &(0, -1, -1))?
     std.test.equal(&added(&end, &back)?, &"2024-01-31")?
+    # As in jiff, a month counts only if the 31st fits before the end.
+    short = start.until(&tz.date(2024, 2, 29)?)?
+    std.test.equal(&(short.years(), short.months(), short.days()), &(0, 0, 29))?
     long = tz.date(1990, 6, 15)?.until(&tz.date(2024, 6, 14)?)?
     std.test.equal(&(long.years(), long.months(), long.days()), &(33, 11, 30))?
     std.test.equal(&tz.date(2000, 1, 1)?.days_until(&tz.date(2024, 1, 1)?), &8766)?
