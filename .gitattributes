@@ -1,4 +1,7 @@
 src/zoneinfo/** binary
 src/tzdb.index binary
+src/tzdb.hashes binary
 src/tzdb.plenty linguist-generated
 tests/data/zdump.txt linguist-generated
+src/zones.plenty linguist-generated
+tests/test_accessors.plenty linguist-generated

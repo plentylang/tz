@@ -836,6 +836,16 @@ pub def zone(name: &str) -> Result[TimeZone, TzError]:
         case Nothing:
             Err(TzError.UnknownZone)
 
+# The zone `name` with `data`, its bundled data, for the functions of
+# `tz.zones`; call those instead. UnknownZone unless `data` is exactly the
+# data bundled for `name`, so no other bytes become a TimeZone. The check
+# reads only the name index and one hash, so it links no zone data.
+pub def bundled_zone(name: &str, data: bytes) -> Result[TimeZone, TzError]:
+    if tzdb.is_bundled(name, &data):
+        Ok(TimeZone(*name, data, 0i32))
+    else:
+        Err(TzError.UnknownZone)
+
 # The IANA release the bundled data comes from, such as "2026f".
 pub def tzdata_version() -> str:
     tzdb.VERSION

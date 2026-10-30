@@ -1,6 +1,7 @@
 # Known transitions, gap and fold disambiguation, and zone conversion.
 import std.test
 import tz
+import tz.tzdb as tzdb
 from std.fmt import FormatError
 from std.time import Timestamp
 
@@ -160,6 +161,15 @@ def test_unknown_and_case_sensitive_names() -> Result[(), Problem]:
     for name in names:
         std.test.is_ok(&tz.zone(&name))?
     Ok(())
+
+# bundled_zone accepts only a zone's own bundled data, under its name or a link.
+def test_bundled_zone_checks_its_data() -> Result[(), Problem]:
+    london = tzdb.ZONE_EUROPE_LONDON
+    std.test.is_ok(&tz.bundled_zone("Europe/London", london))?
+    std.test.equal(&tz.bundled_zone("GB", london)?.iana_name(), &Some("GB"))?
+    std.test.equal(&error_of(&tz.bundled_zone("America/New_York", london)), &Some(tz.TzError.UnknownZone))?
+    std.test.equal(&error_of(&tz.bundled_zone("Europe/London", b"")), &Some(tz.TzError.UnknownZone))?
+    std.test.equal(&error_of(&tz.bundled_zone("Nowhere", london)), &Some(tz.TzError.UnknownZone))
 
 def test_zoned_round_trips() -> Result[(), Problem]:
     for name in ["America/New_York", "Europe/London", "Australia/Lord_Howe", "Pacific/Apia", "America/Sao_Paulo"]?:

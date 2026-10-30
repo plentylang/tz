@@ -16,7 +16,7 @@ Add the dependency to `plenty.toml`, then run `plenty fetch`:
 
 ```toml
 [dependencies]
-tz = { git = "https://github.com/plentylang/tz.git", tag = "v0.1.0" }
+tz = { git = "https://github.com/plentylang/tz.git", tag = "v0.2.0" }
 ```
 
 It needs Plenty 0.7.1 or later.
@@ -70,6 +70,41 @@ All values are small `@copy` classes. Constructors and arithmetic return
 Constructors: `date`, `date_from_epoch_day`, `time`, `midnight`, `datetime`,
 `span` (keyword arguments, each defaulting to 0), `offset`, `offset_hours`,
 `utc`, `fixed`, `zone`, `zoned`, and `now`.
+
+### One zone without the whole database
+
+`tz.zone(name)` can return any zone, so it links all of them (about 150 KB).
+The `tz.zones` module has one function per canonical zone, and each links
+only its own zone's data:
+
+```python
+import tz
+import tz.zones as zones
+
+def main() -> Result[(), tz.TzError | AllocError | IoError]:
+    new_york = zones.america_new_york()
+    meeting = tz.datetime(2024, 3, 10, 2, 30)?.to_zoned(&new_york, tz.Disambiguation.Compatible)?
+    print(meeting.offset().seconds())?
+    Ok(())
+```
+
+A function's name is the zone name in lowercase, with `/` and `-` written
+as `_`, `+` as `_plus_`, and a `-` before a digit as `_minus_`:
+`Etc/GMT+5` is `etc_gmt_plus_5()`. The functions return `TimeZone` and
+cannot fail. Links, the database's alternative names such as
+`Asia/Calcutta`, have no function of their own: `src/zones.plenty` lists
+each link in the comment above its canonical zone's function, and
+`tz.zone` accepts link names.
+
+A file cannot import both `tz` and `tz.zones` under those names, so import
+the module with an alias as above, or import its functions with
+`from tz.zones import america_new_york`.
+
+Only code that imports `tz.zones` reads it.
+
+`tz.bundled_zone(name, data)` is the constructor that `tz.zones` uses. It
+returns `UnknownZone` unless `data` is exactly the data bundled for `name`,
+which it checks with a stored hash. That check reads no zone data.
 
 Arithmetic follows jiff:
 
@@ -129,14 +164,16 @@ default `make install`.
 checks their SHA-512 digests, builds the reference `zic` and `zdump`, and
 compiles the data with `zic -b slim`. It then converts each TZif file into a
 compact form under `src/zoneinfo/` (120,210 bytes in all) and writes
-`src/tzdb.plenty` and `src/tzdb.index`. The format is described at the top
+`src/tzdb.plenty`, its name index and hashes, `src/zones.plenty`, and
+`tests/test_accessors.plenty`. The format is described at the top
 of `src/tzdb.plenty`: transitions as 40-bit times, each zone's types, and the
 TZif footer rule as structured fields, so the package never parses POSIX
 `TZ` strings at run time.
 
 Generating Plenty source instead of reading TZif at run time keeps the
 package free of file access and native code. Each zone is a separate
-constant, so a program that never calls `tz.zone` links no zone data.
+constant, so a program that never calls `tz.zone` links no zone data, and
+a `tz.zones` function links one zone.
 
 The script also writes `tests/data/zdump.txt`: every transition from 1800 to
 2040 in every zone that has one (47,338 vectors), as `zdump` reports it.
@@ -162,15 +199,18 @@ files, which may be built from different data or options.
 Measured on x86-64 Linux with Plenty 0.7.1, `plenty build --release` from a
 clean `target/`, without the compiled-function cache:
 
-| Program | Executable | Build |
-|---|---|---|
-| Empty `main` | 122,008 bytes | 47 ms |
-| Civil dates and `utc()` only | 157,768 bytes | 83 ms |
-| `tz.zone(...)` lookup | 307,624 bytes | 86 ms |
+| Program | Executable | Build | `plenty check` |
+|---|---|---|---|
+| Empty `main` | 122,008 bytes | 47 ms | |
+| Civil dates and `utc()` only | 157,864 bytes | 78 ms | 28 ms |
+| One `tz.zones` function | 165,696 bytes | 86 ms | 33 ms |
+| `tz.zone(...)` lookup | 307,752 bytes | 79 ms | 30 ms |
 
-A zone name is found by binary search over a sorted name table, so a lookup
-adds its code and the zone data (about 150 KB) rather than one comparison per
-name.
+Build times vary by a few milliseconds between runs. Importing `tz.zones`
+adds about 4 ms of checking, since the module has 344 functions; programs that
+do not import it pay nothing. A zone name is found by binary search over a
+sorted name table, so a lookup adds its code and the zone data rather than
+one comparison per name.
 
 ## Testing
 
@@ -188,5 +228,6 @@ The package is licensed under either of the [MIT licence](LICENSE-MIT) or the
 [Apache License, Version 2.0](LICENSE-APACHE), at your option.
 
 The time-zone data under `src/zoneinfo/`, `src/tzdb.plenty`,
-`src/tzdb.index`, and `tests/data/` is derived from the IANA tz database,
+`src/tzdb.index`, `src/tzdb.hashes`, `src/zones.plenty`,
+`tests/test_accessors.plenty`, and `tests/data/` is derived from the IANA tz database,
 which is in the public domain; see [`LICENSE-tzdata`](LICENSE-tzdata).
