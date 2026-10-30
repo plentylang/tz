@@ -1,0 +1,10 @@
+manifest-version = 1
+
+[package]
+name = "tz"
+version = "0.1.0"
+description = "Time zones, civil dates and times, and RFC 3339 for Plenty, with the IANA tz database built in"
+license = "MIT OR Apache-2.0"
+plenty-version = "0.7.1"
+
+[dependencies]

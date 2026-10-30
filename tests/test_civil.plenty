@@ -1,0 +1,99 @@
+# Calendar arithmetic: leap years, month-end clamping, spans, and ranges.
+import std.test
+import tz
+from std.fmt import FormatError
+
+type Problem = std.test.TestError | AllocError | FormatError | tz.TzError
+
+def error_of[T](result: &Result[T, tz.TzError]) -> Option[tz.TzError]:
+    match result:
+        case Ok(_):
+            Nothing
+        case Err(error):
+            Some(*error)
+
+def added(start: &tz.Date, span: &tz.Span) -> Result[str, Problem]:
+    Ok(start.checked_add(span)?.to_string()?)
+
+def test_leap_years() -> Result[(), Problem]:
+    std.test.check(tz.date(2024, 1, 1)?.in_leap_year(), "2024")?
+    std.test.check(tz.date(2000, 1, 1)?.in_leap_year(), "2000")?
+    std.test.check(not tz.date(1900, 1, 1)?.in_leap_year(), "1900")?
+    std.test.check(not tz.date(2100, 1, 1)?.in_leap_year(), "2100")?
+    std.test.is_ok(&tz.date(2024, 2, 29))?
+    std.test.equal(&error_of(&tz.date(2023, 2, 29)), &Some(tz.TzError.InvalidDate))?
+    std.test.equal(&error_of(&tz.date(2100, 2, 29)), &Some(tz.TzError.InvalidDate))?
+    std.test.equal(&tz.date(2024, 2, 1)?.days_in_month(), &29)?
+    std.test.equal(&tz.date(2024, 12, 31)?.day_of_year(), &366)?
+    std.test.equal(&tz.date(2023, 12, 31)?.day_of_year(), &365)?
+    Ok(())
+
+def test_month_end_clamping() -> Result[(), Problem]:
+    std.test.equal(&added(&tz.date(2024, 1, 31)?, &tz.span(months=1))?, &"2024-02-29")?
+    std.test.equal(&added(&tz.date(2023, 1, 31)?, &tz.span(months=1))?, &"2023-02-28")?
+    std.test.equal(&added(&tz.date(2024, 2, 29)?, &tz.span(years=1))?, &"2025-02-28")?
+    std.test.equal(&added(&tz.date(2024, 2, 29)?, &tz.span(years=4))?, &"2028-02-29")?
+    std.test.equal(&added(&tz.date(2024, 3, 31)?, &tz.span(months=-1))?, &"2024-02-29")?
+    # Months apply before days, so the clamp happens first.
+    std.test.equal(&added(&tz.date(2024, 1, 31)?, &tz.span(months=1, days=1))?, &"2024-03-01")?
+    # Clamping is not undone by a later step.
+    std.test.equal(&added(&tz.date(2024, 1, 31)?, &tz.span(months=2))?, &"2024-03-31")?
+    std.test.equal(&added(&tz.date(2024, 12, 15)?, &tz.span(months=1, weeks=2))?, &"2025-01-29")?
+    Ok(())
+
+def test_until() -> Result[(), Problem]:
+    start = tz.date(2024, 1, 31)?
+    end = tz.date(2024, 3, 1)?
+    forward = start.until(&end)?
+    std.test.equal(&(forward.years(), forward.months(), forward.days()), &(0, 1, 1))?
+    std.test.equal(&added(&start, &forward)?, &"2024-03-01")?
+    back = end.until(&start)?
+    std.test.equal(&(back.years(), back.months(), back.days()), &(0, -1, -1))?
+    std.test.equal(&added(&end, &back)?, &"2024-01-31")?
+    long = tz.date(1990, 6, 15)?.until(&tz.date(2024, 6, 14)?)?
+    std.test.equal(&(long.years(), long.months(), long.days()), &(33, 11, 30))?
+    std.test.equal(&tz.date(2000, 1, 1)?.days_until(&tz.date(2024, 1, 1)?), &8766)?
+    Ok(())
+
+def test_weekdays() -> Result[(), Problem]:
+    std.test.equal(&tz.date(1970, 1, 1)?.weekday().number(), &4)?
+    std.test.equal(&tz.date(2024, 1, 1)?.weekday().number(), &1)?
+    std.test.equal(&tz.date(2000, 2, 29)?.weekday().number(), &2)?
+    std.test.equal(&tz.date(-1, 12, 31)?.weekday().number(), &5)?
+    Ok(())
+
+def test_datetime_arithmetic() -> Result[(), Problem]:
+    late = tz.datetime(2024, 12, 31, 23, 30)?
+    std.test.equal(&late.checked_add(&tz.span(minutes=45))?.to_string()?, &"2025-01-01T00:15:00")?
+    std.test.equal(&tz.datetime(2024, 1, 1)?.checked_add(&tz.span(nanoseconds=-1))?.to_string()?, &"2023-12-31T23:59:59.999999999")?
+    std.test.equal(&tz.datetime(2024, 1, 31, 12)?.checked_add(&tz.span(months=1, hours=-13))?.to_string()?, &"2024-02-28T23:00:00")?
+    std.test.equal(&error_of(&tz.date(2024, 1, 1)?.checked_add(&tz.span(hours=1))), &Some(tz.TzError.TimeUnitsOnDate))?
+    Ok(())
+
+def test_ranges() -> Result[(), Problem]:
+    last = tz.date(9999, 12, 31)?
+    first = tz.date(-9999, 1, 1)?
+    std.test.equal(&first.to_string()?, &"-009999-01-01")?
+    std.test.equal(&tz.date(10, 1, 1)?.to_string()?, &"0010-01-01")?
+    std.test.equal(&error_of(&last.checked_add(&tz.span(days=1))), &Some(tz.TzError.OutOfRange))?
+    std.test.equal(&error_of(&first.checked_add(&tz.span(months=-1))), &Some(tz.TzError.OutOfRange))?
+    std.test.equal(&error_of(&last.checked_add(&tz.span(years=i64.MAX))), &Some(tz.TzError.OutOfRange))?
+    std.test.equal(&error_of(&tz.datetime(2024, 1, 1)?.checked_add(&tz.span(seconds=-1, nanoseconds=i64.MIN))), &Some(tz.TzError.OutOfRange))?
+    std.test.equal(&error_of(&tz.datetime(-9999, 1, 1)?.checked_add(&tz.span(nanoseconds=i64.MIN))), &Some(tz.TzError.OutOfRange))?
+    # i64.MIN nanoseconds is about 292 years.
+    std.test.equal(&tz.datetime(2024, 1, 1)?.checked_add(&tz.span(nanoseconds=i64.MIN))?.year(), &1731)?
+    std.test.equal(&error_of(&tz.datetime(2024, 1, 1)?.checked_add(&tz.span(hours=i64.MAX))), &Some(tz.TzError.OutOfRange))?
+    std.test.equal(&error_of(&tz.date(10000, 1, 1)), &Some(tz.TzError.InvalidDate))?
+    std.test.equal(&error_of(&tz.time(24, 0, 0)), &Some(tz.TzError.InvalidTime))?
+    std.test.equal(&error_of(&tz.time(23, 59, 60)), &Some(tz.TzError.InvalidTime))?
+    Ok(())
+
+def test_epoch_day_round_trips() -> Result[(), Problem]:
+    mut day = -4371587
+    while day <= 2932896:
+        value = tz.date_from_epoch_day(day)?
+        std.test.equal(&value.epoch_day(), &day)?
+        std.test.equal(&tz.parse_date(&value.to_string()?)?.epoch_day(), &day)?
+        day += 997
+    std.test.equal(&error_of(&tz.date_from_epoch_day(2932897)), &Some(tz.TzError.OutOfRange))?
+    Ok(())

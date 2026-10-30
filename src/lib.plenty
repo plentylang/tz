@@ -1,0 +1,1193 @@
+# Civil dates and times, IANA time zones, and RFC 3339 / RFC 9557 text.
+# The API follows Rust's jiff: civil values carry no zone, a Zoned is an
+# instant in a zone, and every local time that a transition skips or repeats
+# is resolved by a Disambiguation the caller names. See README.md.
+import tzdb
+import std.time
+from std.fmt import Formatter, FormatError
+from std.time import Timestamp
+
+const SECONDS_PER_DAY: i64 = 86400
+const NANOS_PER_SECOND: i64 = 1000000000
+const NANOS_PER_DAY: i64 = 86400000000000
+const MIN_YEAR: i64 = -9999
+const MAX_YEAR: i64 = 9999
+# Day numbers since 1970-01-01 of -9999-01-01 and 9999-12-31.
+const MIN_DAY: i64 = -4371587
+const MAX_DAY: i64 = 2932896
+# Offsets are below 26 hours in magnitude, as in TZif and jiff.
+const MAX_OFFSET_SECONDS: i64 = 93599
+# UT seconds two days beyond -9999-01-01 and 9999-12-31, so that every
+# wall-clock reading in the supported years is reachable and intermediate
+# sums cannot overflow.
+const MIN_INSTANT: i64 = -377705289600
+const MAX_INSTANT: i64 = 253402560000
+
+# Every recoverable failure of this package.
+pub enum TzError:
+    # A year, month, or day outside its range, or a day the month lacks.
+    InvalidDate
+    # An hour, minute, second, or nanosecond outside its range.
+    InvalidTime
+    # A UTC offset of 26 hours or more.
+    InvalidOffset
+    # A result outside years -9999..=9999, or span arithmetic overflow.
+    OutOfRange
+    # A name that is not in the bundled database.
+    UnknownZone
+    # Text that does not follow the expected format.
+    Syntax
+    # A local time skipped by a transition, with Disambiguation.Reject.
+    Gap
+    # A local time repeated by a transition, with Disambiguation.Reject.
+    Fold
+    # Parsed text whose offset the named zone does not use at that instant.
+    OffsetConflict
+    # A span with hours or smaller units added to a Date.
+    TimeUnitsOnDate
+
+    pub def display[W](self, out: &mut Formatter[W]) -> Result[(), FormatError]:
+        match self:
+            case TzError.InvalidDate:
+                out.text("invalid date")
+            case TzError.InvalidTime:
+                out.text("invalid time")
+            case TzError.InvalidOffset:
+                out.text("invalid UTC offset")
+            case TzError.OutOfRange:
+                out.text("value out of range")
+            case TzError.UnknownZone:
+                out.text("unknown time zone")
+            case TzError.Syntax:
+                out.text("invalid date or time syntax")
+            case TzError.Gap:
+                out.text("local time does not exist in this time zone")
+            case TzError.Fold:
+                out.text("local time is ambiguous in this time zone")
+            case TzError.OffsetConflict:
+                out.text("offset does not match the time zone")
+            case TzError.TimeUnitsOnDate:
+                out.text("a date cannot add hours or smaller units")
+
+# How to choose an instant for a local time that a zone transition skips
+# (a gap) or repeats (a fold). Unambiguous local times ignore it.
+pub enum Disambiguation:
+    # Gap: the instant after the transition, so the clock reading moves
+    # forward by the gap's length. Fold: the earlier instant. This is
+    # RFC 5545 and Temporal's default.
+    Compatible
+    # The earlier of the two instants: in a gap, the reading with the offset
+    # in force after the transition, so the clock moves back.
+    Earlier
+    # The later of the two instants.
+    Later
+    # Err(TzError.Gap) or Err(TzError.Fold).
+    Reject
+
+pub enum Weekday:
+    Monday
+    Tuesday
+    Wednesday
+    Thursday
+    Friday
+    Saturday
+    Sunday
+
+    # ISO 8601 numbering: Monday is 1, Sunday is 7.
+    pub def number(self) -> i64:
+        match self:
+            case Weekday.Monday:
+                1
+            case Weekday.Tuesday:
+                2
+            case Weekday.Wednesday:
+                3
+            case Weekday.Thursday:
+                4
+            case Weekday.Friday:
+                5
+            case Weekday.Saturday:
+                6
+            case Weekday.Sunday:
+                7
+
+# --- Calendar arithmetic ---------------------------------------------------
+
+def is_leap(year: i64) -> bool:
+    (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
+
+def month_days(year: i64, month: i64) -> i64:
+    if month == 2:
+        return 29 if is_leap(year) else 28
+    if month == 4 or month == 6 or month == 9 or month == 11:
+        return 30
+    31
+
+# Days since 1970-01-01 in the proleptic Gregorian calendar (Howard Hinnant's
+# days_from_civil). `//` and `%` floor, so negative years need no adjustment.
+def days_from_civil(year: i64, month: i64, day: i64) -> i64:
+    y = year - 1 if month <= 2 else year
+    era = y // 400
+    year_of_era = y - era * 400
+    shifted_month = (month + 9) % 12
+    day_of_year = (153 * shifted_month + 2) // 5 + day - 1
+    day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
+    era * 146097 + day_of_era - 719468
+
+def civil_from_days(days: i64) -> (i64, i64, i64):
+    z = days + 719468
+    era = z // 146097
+    day_of_era = z - era * 146097
+    year_of_era = (day_of_era - day_of_era // 1460 + day_of_era // 36524 - day_of_era // 146096) // 365
+    day_of_year = day_of_era - (365 * year_of_era + year_of_era // 4 - year_of_era // 100)
+    shifted_month = (5 * day_of_year + 2) // 153
+    day = day_of_year - (153 * shifted_month + 2) // 5 + 1
+    month = shifted_month + 3 if shifted_month < 10 else shifted_month - 9
+    year = year_of_era + era * 400
+    (year + 1 if month <= 2 else year, month, day)
+
+def compared(left: i64, right: i64) -> i64:
+    if left < right:
+        -1
+    elif left > right:
+        1
+    else:
+        0
+
+# --- Dates -----------------------------------------------------------------
+
+# A day in the proleptic Gregorian calendar, years -9999..=9999.
+@copy
+pub class Date:
+    _year: i16
+    _month: u8
+    _day: u8
+
+    pub def year(self) -> i64:
+        i64(self._year)
+
+    pub def month(self) -> i64:
+        i64(self._month)
+
+    pub def day(self) -> i64:
+        i64(self._day)
+
+    # Days since 1970-01-01; negative before it.
+    pub def epoch_day(self) -> i64:
+        days_from_civil(self.year(), self.month(), self.day())
+
+    pub def weekday(self) -> Weekday:
+        match (self.epoch_day() + 3) % 7:
+            case 0:
+                Weekday.Monday
+            case 1:
+                Weekday.Tuesday
+            case 2:
+                Weekday.Wednesday
+            case 3:
+                Weekday.Thursday
+            case 4:
+                Weekday.Friday
+            case 5:
+                Weekday.Saturday
+            case _:
+                Weekday.Sunday
+
+    # 1 for January 1.
+    pub def day_of_year(self) -> i64:
+        self.epoch_day() - days_from_civil(self.year(), 1, 1) + 1
+
+    pub def days_in_month(self) -> i64:
+        month_days(self.year(), self.month())
+
+    pub def in_leap_year(self) -> bool:
+        is_leap(self.year())
+
+    # Years and months move the month, keeping the day unless the new month
+    # is shorter, when it becomes the month's last day; then weeks and days
+    # move the day. Hours and smaller units are TimeUnitsOnDate: use
+    # DateTime.checked_add.
+    pub def checked_add(self, span: &Span) -> Result[Date, TzError]:
+        if span.has_time_units():
+            return Err(TzError.TimeUnitsOnDate)
+        calendar_added(self, span)
+
+    # The years, months, and days from this date to `other`, all with the
+    # sign of the difference, such that checked_add of the result from this
+    # date gives `other`.
+    pub def until(self, other: &Date) -> Result[Span, TzError]:
+        mut months = (other.year() - self.year()) * 12 + other.month() - self.month()
+        mut candidate = months_added(self, months)?
+        if other.epoch_day() >= self.epoch_day():
+            if candidate.epoch_day() > other.epoch_day():
+                months -= 1
+                candidate = months_added(self, months)?
+        elif candidate.epoch_day() < other.epoch_day():
+            months += 1
+            candidate = months_added(self, months)?
+        # Truncating division keeps years and months on the same side of zero.
+        years = months // 12 if months >= 0 else -(-months // 12)
+        Ok(Span(years, months - years * 12, 0, other.epoch_day() - candidate.epoch_day(), 0, 0, 0, 0))
+
+    pub def days_until(self, other: &Date) -> i64:
+        other.epoch_day() - self.epoch_day()
+
+    pub def at(self, time: &Time) -> DateTime:
+        DateTime(*self, *time)
+
+    # -1, 0, or 1 as this date is before, equal to, or after `other`.
+    pub def compare(self, other: &Date) -> i64:
+        compared(self.epoch_day(), other.epoch_day())
+
+    # YYYY-MM-DD; a year outside 0..=9999 is a sign and six digits.
+    pub def display[W](self, out: &mut Formatter[W]) -> Result[(), FormatError]:
+        year = self.year()
+        if year < 0:
+            out.format(f"-{-year:06d}")?
+        elif year > 9999:
+            out.format(f"+{year:06d}")?
+        else:
+            out.format(f"{year:04d}")?
+        out.format(f"-{self.month():02d}-{self.day():02d}")
+
+    pub def to_string(self) -> Result[str, FormatError]:
+        f"{self}"
+
+pub def date(year: i64, month: i64, day: i64) -> Result[Date, TzError]:
+    if year < MIN_YEAR or year > MAX_YEAR or month < 1 or month > 12:
+        return Err(TzError.InvalidDate)
+    if day < 1 or day > month_days(year, month):
+        return Err(TzError.InvalidDate)
+    Ok(Date(i16(year), u8(month), u8(day)))
+
+# The date `days` after 1970-01-01, the inverse of Date.epoch_day.
+pub def date_from_epoch_day(days: i64) -> Result[Date, TzError]:
+    if days < MIN_DAY or days > MAX_DAY:
+        return Err(TzError.OutOfRange)
+    (year, month, day) = civil_from_days(days)
+    Ok(Date(i16(year), u8(month), u8(day)))
+
+def months_added(start: &Date, months: i64) -> Result[Date, TzError]:
+    if months == 0:
+        return Ok(*start)
+    # Bounding the count first keeps the index arithmetic from overflowing.
+    if months < -240000 or months > 240000:
+        return Err(TzError.OutOfRange)
+    index = start.year() * 12 + start.month() - 1 + months
+    year = index // 12
+    month = index % 12 + 1
+    if year < MIN_YEAR or year > MAX_YEAR:
+        return Err(TzError.OutOfRange)
+    last = month_days(year, month)
+    day = start.day() if start.day() <= last else last
+    Ok(Date(i16(year), u8(month), u8(day)))
+
+# Calendar units bounded so that sums of them cannot overflow.
+const UNIT_LIMIT: i64 = 100000000
+
+def calendar_added(start: &Date, span: &Span) -> Result[Date, TzError]:
+    if span.calendar_too_large():
+        return Err(TzError.OutOfRange)
+    moved = months_added(start, span._years * 12 + span._months)?
+    days = span._weeks * 7 + span._days
+    if days == 0:
+        return Ok(moved)
+    date_from_epoch_day(moved.epoch_day() + days)
+
+# --- Times -----------------------------------------------------------------
+
+# A time of day with nanosecond precision. There are no leap seconds.
+@copy
+pub class Time:
+    _hour: u8
+    _minute: u8
+    _second: u8
+    _nanosecond: u32
+
+    pub def hour(self) -> i64:
+        i64(self._hour)
+
+    pub def minute(self) -> i64:
+        i64(self._minute)
+
+    pub def second(self) -> i64:
+        i64(self._second)
+
+    pub def nanosecond(self) -> i64:
+        i64(self._nanosecond)
+
+    def second_of_day(self) -> i64:
+        self.hour() * 3600 + self.minute() * 60 + self.second()
+
+    def nanosecond_of_day(self) -> i64:
+        self.second_of_day() * NANOS_PER_SECOND + self.nanosecond()
+
+    pub def compare(self, other: &Time) -> i64:
+        compared(self.nanosecond_of_day(), other.nanosecond_of_day())
+
+    # HH:MM:SS, then a fraction without trailing zeros when it is nonzero.
+    pub def display[W](self, out: &mut Formatter[W]) -> Result[(), FormatError]:
+        out.format(f"{self.hour():02d}:{self.minute():02d}:{self.second():02d}")?
+        mut fraction = self.nanosecond()
+        if fraction == 0:
+            return Ok(())
+        mut digits = 9
+        while fraction % 10 == 0:
+            fraction = fraction // 10
+            digits -= 1
+        out.format(f".{fraction:0{digits}d}")
+
+    pub def to_string(self) -> Result[str, FormatError]:
+        f"{self}"
+
+pub def time(hour: i64, minute: i64, second: i64, nanosecond: i64 = 0) -> Result[Time, TzError]:
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 59:
+        return Err(TzError.InvalidTime)
+    if nanosecond < 0 or nanosecond >= NANOS_PER_SECOND:
+        return Err(TzError.InvalidTime)
+    Ok(Time(u8(hour), u8(minute), u8(second), u32(nanosecond)))
+
+pub def midnight() -> Time:
+    Time(0u8, 0u8, 0u8, 0u32)
+
+def time_from_nanosecond_of_day(value: i64) -> Time:
+    seconds = value // NANOS_PER_SECOND
+    Time(u8(seconds // 3600), u8(seconds // 60 % 60), u8(seconds % 60), u32(value % NANOS_PER_SECOND))
+
+# --- Civil date-times ------------------------------------------------------
+
+# A date and time of day with no time zone.
+@copy
+pub class DateTime:
+    _date: Date
+    _time: Time
+
+    pub def date(self) -> Date:
+        self._date
+
+    pub def time(self) -> Time:
+        self._time
+
+    pub def year(self) -> i64:
+        self._date.year()
+
+    pub def month(self) -> i64:
+        self._date.month()
+
+    pub def day(self) -> i64:
+        self._date.day()
+
+    pub def hour(self) -> i64:
+        self._time.hour()
+
+    pub def minute(self) -> i64:
+        self._time.minute()
+
+    pub def second(self) -> i64:
+        self._time.second()
+
+    pub def nanosecond(self) -> i64:
+        self._time.nanosecond()
+
+    pub def weekday(self) -> Weekday:
+        self._date.weekday()
+
+    # Seconds since 1970-01-01T00:00:00 of this wall-clock reading.
+    def local_seconds(self) -> i64:
+        self._date.epoch_day() * SECONDS_PER_DAY + self._time.second_of_day()
+
+    # Calendar units move the date as Date.checked_add does; then hours and
+    # smaller units move the clock, carrying whole days. With no zone, every
+    # day here is 24 hours: use Zoned.checked_add for elapsed time.
+    pub def checked_add(self, span: &Span) -> Result[DateTime, TzError]:
+        moved = calendar_added(&self._date, span)?
+        nanos = self._time.nanosecond_of_day() + span.time_nanoseconds()?
+        days = nanos // NANOS_PER_DAY
+        if days == 0:
+            return Ok(DateTime(moved, time_from_nanosecond_of_day(nanos)))
+        shifted = date_from_epoch_day(moved.epoch_day() + days)?
+        Ok(DateTime(shifted, time_from_nanosecond_of_day(nanos % NANOS_PER_DAY)))
+
+    # The instant this wall-clock reading names in `zone`.
+    pub def to_zoned(self, zone: &TimeZone, disambiguation: Disambiguation) -> Result[Zoned, TzError]:
+        seconds = resolved(zone, self, disambiguation)?
+        zoned_at(seconds, self._time._nanosecond, zone)
+
+    pub def compare(self, other: &DateTime) -> i64:
+        by_date = self._date.compare(&other._date)
+        if by_date != 0:
+            by_date
+        else:
+            self._time.compare(&other._time)
+
+    # YYYY-MM-DDTHH:MM:SS[.fraction]
+    pub def display[W](self, out: &mut Formatter[W]) -> Result[(), FormatError]:
+        out.format(f"{self._date}T{self._time}")
+
+    pub def to_string(self) -> Result[str, FormatError]:
+        f"{self}"
+
+pub def datetime(year: i64, month: i64, day: i64, hour: i64 = 0, minute: i64 = 0, second: i64 = 0, nanosecond: i64 = 0) -> Result[DateTime, TzError]:
+    Ok(DateTime(date(year, month, day)?, time(hour, minute, second, nanosecond)?))
+
+def datetime_from_local(local: i64, nanosecond: u32) -> Result[DateTime, TzError]:
+    day = date_from_epoch_day(local // SECONDS_PER_DAY)?
+    second_of_day = local % SECONDS_PER_DAY
+    Ok(DateTime(day, time_from_nanosecond_of_day(second_of_day * NANOS_PER_SECOND + i64(nanosecond))))
+
+# --- Spans -----------------------------------------------------------------
+
+# An amount of time in calendar units (years, months, weeks, days) and exact
+# units (hours down to nanoseconds). Fields may have either sign.
+@copy
+pub class Span:
+    _years: i64
+    _months: i64
+    _weeks: i64
+    _days: i64
+    _hours: i64
+    _minutes: i64
+    _seconds: i64
+    _nanoseconds: i64
+
+    pub def years(self) -> i64:
+        self._years
+
+    pub def months(self) -> i64:
+        self._months
+
+    pub def weeks(self) -> i64:
+        self._weeks
+
+    pub def days(self) -> i64:
+        self._days
+
+    pub def hours(self) -> i64:
+        self._hours
+
+    pub def minutes(self) -> i64:
+        self._minutes
+
+    pub def seconds(self) -> i64:
+        self._seconds
+
+    pub def nanoseconds(self) -> i64:
+        self._nanoseconds
+
+    pub def is_zero(self) -> bool:
+        not self.has_calendar_units() and not self.has_time_units()
+
+    pub def has_calendar_units(self) -> bool:
+        self._years != 0 or self._months != 0 or self._weeks != 0 or self._days != 0
+
+    pub def has_time_units(self) -> bool:
+        self._hours != 0 or self._minutes != 0 or self._seconds != 0 or self._nanoseconds != 0
+
+    def calendar_too_large(self) -> bool:
+        too_large(self._years) or too_large(self._months) or too_large(self._weeks) or too_large(self._days)
+
+    # The exact units as nanoseconds; OutOfRange beyond about 292 years.
+    def time_nanoseconds(self) -> Result[i64, TzError]:
+        if too_large(self._hours) or too_large(self._minutes):
+            return Err(TzError.OutOfRange)
+        if self._seconds < -1000000000000 or self._seconds > 1000000000000:
+            return Err(TzError.OutOfRange)
+        total = (self._hours * 3600 + self._minutes * 60 + self._seconds)
+        if total < -9000000000 or total > 9000000000:
+            return Err(TzError.OutOfRange)
+        nanos = total * NANOS_PER_SECOND
+        if (self._nanoseconds > 0 and nanos > i64.MAX - self._nanoseconds) or (self._nanoseconds < 0 and nanos < i64.MIN - self._nanoseconds):
+            return Err(TzError.OutOfRange)
+        Ok(nanos + self._nanoseconds)
+
+def too_large(value: i64) -> bool:
+    value < -UNIT_LIMIT or value > UNIT_LIMIT
+
+# Units are independent and may mix signs. Applying a span whose years,
+# months, weeks, days, hours, or minutes exceed 100,000,000 in magnitude is
+# OutOfRange.
+pub def span(years: i64 = 0, months: i64 = 0, weeks: i64 = 0, days: i64 = 0, hours: i64 = 0, minutes: i64 = 0, seconds: i64 = 0, nanoseconds: i64 = 0) -> Span:
+    Span(years, months, weeks, days, hours, minutes, seconds, nanoseconds)
+
+# --- Offsets ---------------------------------------------------------------
+
+# A UTC offset in seconds, east positive, below 26 hours in magnitude.
+@copy
+pub class Offset:
+    _seconds: i32
+
+    pub def seconds(self) -> i64:
+        i64(self._seconds)
+
+    # +HH:MM, with :SS when the offset has seconds (as local mean time does).
+    pub def display[W](self, out: &mut Formatter[W]) -> Result[(), FormatError]:
+        total = self.seconds()
+        magnitude = -total if total < 0 else total
+        sign = "-" if total < 0 else "+"
+        out.format(f"{sign}{magnitude // 3600:02d}:{magnitude // 60 % 60:02d}")?
+        if magnitude % 60 != 0:
+            out.format(f":{magnitude % 60:02d}")?
+        Ok(())
+
+    pub def to_string(self) -> Result[str, FormatError]:
+        f"{self}"
+
+pub def offset(seconds: i64) -> Result[Offset, TzError]:
+    if seconds < -MAX_OFFSET_SECONDS or seconds > MAX_OFFSET_SECONDS:
+        return Err(TzError.InvalidOffset)
+    Ok(Offset(i32(seconds)))
+
+pub def offset_hours(hours: i64) -> Result[Offset, TzError]:
+    if hours < -25 or hours > 25:
+        return Err(TzError.InvalidOffset)
+    offset(hours * 3600)
+
+# The offset, daylight-saving flag, and abbreviation a zone uses at an
+# instant. The abbreviation is "UTC" for utc() and empty for fixed().
+@copy
+pub class OffsetInfo:
+    _offset: Offset
+    _dst: bool
+    _abbreviation: str
+
+    pub def offset(self) -> Offset:
+        self._offset
+
+    pub def is_dst(self) -> bool:
+        self._dst
+
+    pub def abbreviation(self) -> str:
+        self._abbreviation
+
+# What a wall-clock reading means in a zone. Gap and Fold carry the offsets
+# in force before and after the transition that causes them.
+pub enum LocalOffsets:
+    Unique(Offset)
+    Gap(Offset, Offset)
+    Fold(Offset, Offset)
+
+# --- Zone data -------------------------------------------------------------
+# The layout is described at the top of tzdb.plenty.
+
+def byte_at(data: bytes, at: i64) -> i64:
+    i64(data[at])
+
+def u16_at(data: bytes, at: i64) -> i64:
+    (byte_at(data, at) << 8) | byte_at(data, at + 1)
+
+def i32_at(data: bytes, at: i64) -> i64:
+    value = (u16_at(data, at) << 16) | u16_at(data, at + 2)
+    value - 4294967296 if value >= 2147483648 else value
+
+def i40_at(data: bytes, at: i64) -> i64:
+    value = (byte_at(data, at) << 32) | (u16_at(data, at + 1) << 16) | u16_at(data, at + 3)
+    value - 1099511627776 if value >= 549755813888 else value
+
+def counts_at(data: bytes) -> i64:
+    2 + 7 * byte_at(data, 1)
+
+def transition_count(data: bytes) -> i64:
+    u16_at(data, counts_at(data))
+
+def transition_time(data: bytes, index: i64) -> i64:
+    i40_at(data, counts_at(data) + 2 + 5 * index)
+
+def transition_type(data: bytes, index: i64) -> i64:
+    byte_at(data, counts_at(data) + 2 + 5 * transition_count(data) + index)
+
+def footer_at(data: bytes) -> i64:
+    counts_at(data) + 2 + 6 * transition_count(data)
+
+@copy
+class Period:
+    offset: i64
+    dst: bool
+    # A tzdb.abbreviation id, or -1 for the zone's own name.
+    abbreviation: i64
+
+def type_period(data: bytes, index: i64) -> Period:
+    at = 2 + 7 * index
+    Period(i32_at(data, at), byte_at(data, at + 4) != 0, u16_at(data, at + 5))
+
+# The year containing a local second.
+def year_of(local: i64) -> i64:
+    (year, _, _) = civil_from_days(local // SECONDS_PER_DAY)
+    year
+
+# Local seconds at which a POSIX TZ rule (RFC 8536 section 3.3.1) fires in
+# `year`: Jn counts days 1..=365 without February 29, n counts 0..=365 with
+# it, and Mm.w.d is weekday d (0 Sunday) of week w (5 the last) of month m.
+def rule_seconds(data: bytes, at: i64, year: i64) -> i64:
+    kind = byte_at(data, at)
+    day = u16_at(data, at + 1)
+    mut days = days_from_civil(year, 1, 1)
+    if kind == 0:
+        days += day - 1 + (1 if is_leap(year) and day >= 60 else 0)
+    elif kind == 1:
+        days += day
+    else:
+        month = byte_at(data, at + 3)
+        week = byte_at(data, at + 4)
+        weekday = byte_at(data, at + 5)
+        first = days_from_civil(year, month, 1)
+        # 1970-01-01 was a Thursday, weekday 4.
+        days = first + (weekday - (first + 4) % 7) % 7 + (week - 1) * 7
+        if days - first >= month_days(year, month):
+            days -= 7
+    days * SECONDS_PER_DAY + i32_at(data, at + 6)
+
+# The UT seconds at which daylight saving starts and ends in `year`. The
+# start rule is in standard local time, the end rule in daylight time.
+def footer_transitions(data: bytes, at: i64, year: i64) -> (i64, i64):
+    standard = i32_at(data, at + 1)
+    daylight = i32_at(data, at + 7)
+    (rule_seconds(data, at + 13, year) - standard, rule_seconds(data, at + 23, year) - daylight)
+
+def footer_period(data: bytes, seconds: i64) -> Period:
+    at = footer_at(data)
+    kind = byte_at(data, at)
+    if kind == 0:
+        count = transition_count(data)
+        return type_period(data, transition_type(data, count - 1) if count > 0 else 0)
+    standard = Period(i32_at(data, at + 1), False, u16_at(data, at + 5))
+    if kind == 1:
+        return standard
+    daylight = Period(i32_at(data, at + 7), True, u16_at(data, at + 11))
+    (start, end) = footer_transitions(data, at, year_of(seconds + standard.offset))
+    # Southern-hemisphere rules end daylight saving before starting it.
+    in_daylight = (start <= seconds and seconds < end) if start < end else not (end <= seconds and seconds < start)
+    daylight if in_daylight else standard
+
+def period_at(zone: &TimeZone, seconds: i64) -> Period:
+    data = zone._data
+    if len(data) == 0:
+        return Period(i64(zone._fixed), False, -1)
+    count = transition_count(data)
+    if count == 0 or seconds >= transition_time(data, count - 1):
+        return footer_period(data, seconds)
+    if seconds < transition_time(data, 0):
+        return type_period(data, 0)
+    # The last transition at or before `seconds`: low <= answer < high.
+    mut low = 0
+    mut high = count - 1
+    while high - low > 1:
+        middle = low + (high - low) // 2
+        if transition_time(data, middle) <= seconds:
+            low = middle
+        else:
+            high = middle
+    type_period(data, transition_type(data, low))
+
+def next_transition_after(zone: &TimeZone, seconds: i64) -> Option[i64]:
+    data = zone._data
+    if len(data) == 0:
+        return Nothing
+    count = transition_count(data)
+    if count > 0 and seconds < transition_time(data, count - 1):
+        if seconds < transition_time(data, 0):
+            return Some(transition_time(data, 0))
+        # The first transition after `seconds`: low < answer <= high.
+        mut low = 0
+        mut high = count - 1
+        while high - low > 1:
+            middle = low + (high - low) // 2
+            if transition_time(data, middle) > seconds:
+                high = middle
+            else:
+                low = middle
+        return Some(transition_time(data, high))
+    at = footer_at(data)
+    if byte_at(data, at) != 2 or seconds > MAX_INSTANT:
+        return Nothing
+    lower = seconds
+    year = year_of(lower + i32_at(data, at + 1))
+    mut best = i64.MAX
+    for candidate in range(year - 1, year + 2):
+        (start, end) = footer_transitions(data, at, candidate)
+        if start > lower and start < best:
+            best = start
+        if end > lower and end < best:
+            best = end
+    if best == i64.MAX:
+        Nothing
+    else:
+        Some(best)
+
+def local_offsets_at(zone: &TimeZone, local: i64) -> LocalOffsets:
+    if len(zone._data) == 0:
+        return LocalOffsets.Unique(Offset(zone._fixed))
+    # Offsets are below 26 hours, so the UT instants that can show `local`
+    # lie within two days of it. Walk the periods there in order: a period's
+    # offset is valid when the period at `local - offset` uses it.
+    low = local - 2 * SECONDS_PER_DAY
+    high = local + 2 * SECONDS_PER_DAY
+    mut current = period_at(zone, low).offset
+    mut at = low
+    mut found = 0
+    mut first = 0
+    mut second = 0
+    mut gap_before = current
+    mut gap_after = current
+    while True:
+        if period_at(zone, local - current).offset == current:
+            if found == 0:
+                first = current
+                found = 1
+            elif found == 1 and current != first:
+                second = current
+                found = 2
+        match next_transition_after(zone, at):
+            case Some(next):
+                if next > high:
+                    break
+                following = period_at(zone, next).offset
+                if current < following and next + current <= local and local < next + following:
+                    gap_before = current
+                    gap_after = following
+                at = next
+                current = following
+            case Nothing:
+                break
+    if found == 2:
+        LocalOffsets.Fold(Offset(i32(first)), Offset(i32(second)))
+    elif found == 1:
+        LocalOffsets.Unique(Offset(i32(first)))
+    else:
+        LocalOffsets.Gap(Offset(i32(gap_before)), Offset(i32(gap_after)))
+
+def resolved(zone: &TimeZone, local_time: &DateTime, disambiguation: Disambiguation) -> Result[i64, TzError]:
+    local = local_time.local_seconds()
+    match local_offsets_at(zone, local):
+        case LocalOffsets.Unique(only):
+            Ok(local - only.seconds())
+        case LocalOffsets.Gap(before, after):
+            # In a gap the offset after is larger, so it gives the earlier
+            # instant.
+            match disambiguation:
+                case Disambiguation.Compatible | Disambiguation.Later:
+                    Ok(local - before.seconds())
+                case Disambiguation.Earlier:
+                    Ok(local - after.seconds())
+                case Disambiguation.Reject:
+                    Err(TzError.Gap)
+        case LocalOffsets.Fold(before, after):
+            match disambiguation:
+                case Disambiguation.Compatible | Disambiguation.Earlier:
+                    Ok(local - before.seconds())
+                case Disambiguation.Later:
+                    Ok(local - after.seconds())
+                case Disambiguation.Reject:
+                    Err(TzError.Fold)
+
+# --- Time zones ------------------------------------------------------------
+
+# UTC, a fixed offset, or a zone of the bundled IANA database. Copying one
+# copies references to read-only data; nothing is allocated.
+@copy
+pub class TimeZone:
+    _name: str
+    _data: bytes
+    _fixed: i32
+
+    # The database name this zone was looked up by; Nothing for utc() and
+    # fixed().
+    pub def iana_name(self) -> Option[str]:
+        if len(self._data) == 0:
+            Nothing
+        else:
+            Some(self._name)
+
+    pub def is_fixed(self) -> bool:
+        len(self._data) == 0
+
+    pub def info_at(self, instant: &Timestamp) -> OffsetInfo:
+        period = period_at(self, instant.seconds)
+        abbreviation = self._name if period.abbreviation < 0 else tzdb.abbreviation(u16(period.abbreviation))
+        OffsetInfo(Offset(i32(period.offset)), period.dst, abbreviation)
+
+    pub def offset_at(self, instant: &Timestamp) -> Offset:
+        Offset(i32(period_at(self, instant.seconds).offset))
+
+    # The first instant after `instant` at which the offset, daylight-saving
+    # flag, or abbreviation may change; Nothing if there is none.
+    pub def next_transition(self, instant: &Timestamp) -> Option[Timestamp]:
+        match next_transition_after(self, instant.seconds):
+            case Some(seconds):
+                Some(Timestamp(seconds, 0u32))
+            case Nothing:
+                Nothing
+
+    # Whether a wall-clock reading is unique, skipped, or repeated here.
+    pub def local_offsets(self, local_time: &DateTime) -> LocalOffsets:
+        local_offsets_at(self, local_time.local_seconds())
+
+pub def utc() -> TimeZone:
+    TimeZone("UTC", b"", 0i32)
+
+pub def fixed(at: &Offset) -> TimeZone:
+    TimeZone("", b"", at._seconds)
+
+# A zone or link of the bundled database by its exact, case-sensitive name,
+# such as "America/New_York" or "UTC".
+pub def zone(name: &str) -> Result[TimeZone, TzError]:
+    match tzdb.lookup(name):
+        case Some(data):
+            Ok(TimeZone(*name, data, 0i32))
+        case Nothing:
+            Err(TzError.UnknownZone)
+
+# The IANA release the bundled data comes from, such as "2026f".
+pub def tzdata_version() -> str:
+    tzdb.VERSION
+
+# Every zone and link name in the database, sorted and separated by "\n".
+pub def zone_names() -> str:
+    tzdb.NAMES
+
+# --- Zoned date-times ------------------------------------------------------
+
+# An instant with nanosecond precision in a time zone, and the wall-clock
+# reading that instant has there.
+@copy
+pub class Zoned:
+    _seconds: i64
+    _nanosecond: u32
+    _offset: Offset
+    _zone: TimeZone
+    _datetime: DateTime
+
+    pub def timestamp(self) -> Timestamp:
+        Timestamp(self._seconds, self._nanosecond)
+
+    pub def zone(self) -> TimeZone:
+        self._zone
+
+    pub def offset(self) -> Offset:
+        self._offset
+
+    pub def info(self) -> OffsetInfo:
+        self._zone.info_at(&self.timestamp())
+
+    pub def datetime(self) -> DateTime:
+        self._datetime
+
+    pub def date(self) -> Date:
+        self._datetime.date()
+
+    pub def time(self) -> Time:
+        self._datetime.time()
+
+    pub def year(self) -> i64:
+        self._datetime.year()
+
+    pub def month(self) -> i64:
+        self._datetime.month()
+
+    pub def day(self) -> i64:
+        self._datetime.day()
+
+    pub def hour(self) -> i64:
+        self._datetime.hour()
+
+    pub def minute(self) -> i64:
+        self._datetime.minute()
+
+    pub def second(self) -> i64:
+        self._datetime.second()
+
+    pub def nanosecond(self) -> i64:
+        self._datetime.nanosecond()
+
+    # The same instant in another zone.
+    pub def in_zone(self, other: &TimeZone) -> Result[Zoned, TzError]:
+        zoned_at(self._seconds, self._nanosecond, other)
+
+    # Calendar units move the wall-clock date as Date.checked_add does and
+    # keep the time of day; the result is resolved with `disambiguation`.
+    # Hours and smaller units then move the instant by exact elapsed time,
+    # so adding 24 hours across a daylight-saving change differs from adding
+    # one day.
+    pub def checked_add(self, span: &Span, disambiguation: Disambiguation) -> Result[Zoned, TzError]:
+        mut seconds = self._seconds
+        if span.has_calendar_units():
+            moved = DateTime(calendar_added(&self._datetime._date, span)?, self._datetime._time)
+            seconds = resolved(&self._zone, &moved, disambiguation)?
+        nanos = i64(self._nanosecond) + span.time_nanoseconds()?
+        whole = seconds + nanos // NANOS_PER_SECOND
+        zoned_at(whole, u32(nanos % NANOS_PER_SECOND), &self._zone)
+
+    # The exact elapsed time to `other` in hours, minutes, seconds, and
+    # nanoseconds, all with the sign of the difference.
+    pub def span_until(self, other: &Zoned) -> Span:
+        mut seconds = other._seconds - self._seconds
+        mut nanos = i64(other._nanosecond) - i64(self._nanosecond)
+        if seconds > 0 and nanos < 0:
+            seconds -= 1
+            nanos += NANOS_PER_SECOND
+        elif seconds < 0 and nanos > 0:
+            seconds += 1
+            nanos -= NANOS_PER_SECOND
+        sign = -1 if seconds < 0 else 1
+        magnitude = seconds * sign
+        Span(0, 0, 0, 0, sign * (magnitude // 3600), sign * (magnitude // 60 % 60), sign * (magnitude % 60), nanos)
+
+    # Orders by instant; zones are not compared.
+    pub def compare(self, other: &Zoned) -> i64:
+        by_second = compared(self._seconds, other._seconds)
+        if by_second != 0:
+            by_second
+        else:
+            compared(i64(self._nanosecond), i64(other._nanosecond))
+
+    # RFC 9557: 2024-03-10T03:30:00-04:00[America/New_York]. A fixed() zone
+    # writes its offset in the brackets, and utc() writes [UTC].
+    pub def display[W](self, out: &mut Formatter[W]) -> Result[(), FormatError]:
+        out.format(f"{self._datetime}{self._offset}[")?
+        if self._zone._name == "":
+            out.format(f"{self._offset}]")
+        else:
+            out.format(f"{self._zone._name}]")
+
+    pub def to_string(self) -> Result[str, FormatError]:
+        f"{self}"
+
+def zoned_at(seconds: i64, nanosecond: u32, zone: &TimeZone) -> Result[Zoned, TzError]:
+    if seconds < MIN_INSTANT or seconds > MAX_INSTANT or i64(nanosecond) >= NANOS_PER_SECOND:
+        return Err(TzError.OutOfRange)
+    shift = period_at(zone, seconds).offset
+    local = datetime_from_local(seconds + shift, nanosecond)?
+    Ok(Zoned(seconds, nanosecond, Offset(i32(shift)), *zone, local))
+
+# A std.time.Timestamp in `zone`. OutOfRange when the wall-clock reading is
+# outside years -9999..=9999 or `instant.nanoseconds` is 1e9 or more.
+pub def zoned(instant: &Timestamp, zone: &TimeZone) -> Result[Zoned, TzError]:
+    zoned_at(instant.seconds, instant.nanoseconds, zone)
+
+# The current wall-clock time in `zone`.
+pub def now(zone: &TimeZone) -> Result[Zoned, TzError]:
+    zoned(&std.time.wall_now(), zone)
+
+# --- Parsing ---------------------------------------------------------------
+
+const PLUS: i64 = 43
+const MINUS: i64 = 45
+const COLON: i64 = 58
+
+class Cursor:
+    text: str
+    at: i64
+
+    def peek(self) -> i64:
+        if self.at >= self.text.byte_len():
+            return -1
+        # cursor() admits only ASCII, so scalar and byte positions agree.
+        match ord(self.text[self.at]):
+            case Ok(code):
+                i64(code)
+            case Err(_):
+                -1
+
+    def done(self) -> bool:
+        self.at >= self.text.byte_len()
+
+    def eat(self: &mut Cursor, code: i64) -> bool:
+        if self.peek() == code:
+            self.at += 1
+            True
+        else:
+            False
+
+    def expect(self: &mut Cursor, code: i64) -> Result[(), TzError]:
+        if self.eat(code):
+            Ok(())
+        else:
+            Err(TzError.Syntax)
+
+    def digits(self: &mut Cursor, count: i64) -> Result[i64, TzError]:
+        mut value = 0
+        for _ in range(count):
+            code = self.peek()
+            if code < 48 or code > 57:
+                return Err(TzError.Syntax)
+            value = value * 10 + code - 48
+            self.at += 1
+        Ok(value)
+
+    def finish(self) -> Result[(), TzError]:
+        if self.done():
+            Ok(())
+        else:
+            Err(TzError.Syntax)
+
+def cursor(text: &str) -> Result[Cursor, TzError]:
+    if not text.isascii():
+        return Err(TzError.Syntax)
+    Ok(Cursor(*text, 0))
+
+# YYYY-MM-DD, or with `extended` also ISO 8601 expanded years +YYYYYY and
+# -YYYYYY (-000000 is rejected).
+def read_date(text: &mut Cursor, extended: bool) -> Result[Date, TzError]:
+    mut year = 0
+    sign = text.peek()
+    if sign == PLUS or sign == MINUS:
+        if not extended:
+            return Err(TzError.Syntax)
+        text.at += 1
+        year = text.digits(6)?
+        if sign == MINUS:
+            if year == 0:
+                return Err(TzError.Syntax)
+            year = -year
+    else:
+        year = text.digits(4)?
+    text.expect(MINUS)?
+    month = text.digits(2)?
+    text.expect(MINUS)?
+    day = text.digits(2)?
+    date(year, month, day)
+
+# HH:MM:SS with an optional fraction of 1 to 9 digits after a period. A
+# leap second (60) is InvalidTime.
+def read_time(text: &mut Cursor) -> Result[Time, TzError]:
+    hour = text.digits(2)?
+    text.expect(COLON)?
+    minute = text.digits(2)?
+    text.expect(COLON)?
+    second = text.digits(2)?
+    mut nanosecond = 0
+    if text.eat(46):
+        mut digits = 0
+        mut code = text.peek()
+        while code >= 48 and code <= 57:
+            if digits == 9:
+                return Err(TzError.Syntax)
+            nanosecond = nanosecond * 10 + code - 48
+            digits += 1
+            text.at += 1
+            code = text.peek()
+        if digits == 0:
+            return Err(TzError.Syntax)
+        for _ in range(digits, 9):
+            nanosecond *= 10
+    time(hour, minute, second, nanosecond)
+
+# RFC 3339 allows "T", "t", or (by its section 5.6 note) a space.
+def read_datetime(text: &mut Cursor, extended: bool) -> Result[DateTime, TzError]:
+    day = read_date(text, extended)?
+    if not text.eat(84) and not text.eat(116) and not text.eat(32):
+        return Err(TzError.Syntax)
+    Ok(DateTime(day, read_time(text)?))
+
+# Z or z is Nothing (UT, local offset unknown); otherwise +HH:MM, or with
+# `seconds` also +HH:MM:SS. Hours are 00..=23 and minutes 00..=59.
+def read_offset(text: &mut Cursor, seconds: bool) -> Result[Option[Offset], TzError]:
+    if text.eat(90) or text.eat(122):
+        return Ok(Nothing)
+    sign = text.peek()
+    if sign != PLUS and sign != MINUS:
+        return Err(TzError.Syntax)
+    text.at += 1
+    hours = text.digits(2)?
+    text.expect(COLON)?
+    minutes = text.digits(2)?
+    mut extra = 0
+    if seconds and text.eat(COLON):
+        extra = text.digits(2)?
+    if hours > 23 or minutes > 59 or extra > 59:
+        return Err(TzError.InvalidOffset)
+    total = hours * 3600 + minutes * 60 + extra
+    Ok(Some(Offset(i32(-total if sign == MINUS else total))))
+
+# YYYY-MM-DD, or +YYYYYY-MM-DD / -YYYYYY-MM-DD for other years.
+pub def parse_date(text: &str) -> Result[Date, TzError]:
+    mut input = cursor(text)?
+    value = read_date(&mut input, True)?
+    input.finish()?
+    Ok(value)
+
+# HH:MM:SS[.fraction]
+pub def parse_time(text: &str) -> Result[Time, TzError]:
+    mut input = cursor(text)?
+    value = read_time(&mut input)?
+    input.finish()?
+    Ok(value)
+
+# A date and time joined by T, t, or a space, with no offset.
+pub def parse_datetime(text: &str) -> Result[DateTime, TzError]:
+    mut input = cursor(text)?
+    value = read_datetime(&mut input, True)?
+    input.finish()?
+    Ok(value)
+
+# +HH:MM or +HH:MM:SS (or with -).
+pub def parse_offset(text: &str) -> Result[Offset, TzError]:
+    mut input = cursor(text)?
+    match read_offset(&mut input, True)?:
+        case Some(value):
+            input.finish()?
+            Ok(value)
+        case Nothing:
+            Err(TzError.Syntax)
+
+# An RFC 3339 date-time: four-digit year, offset Z, z, or +HH:MM (-00:00 is
+# accepted and means UT), no leap second.
+pub def parse_timestamp(text: &str) -> Result[Timestamp, TzError]:
+    mut input = cursor(text)?
+    local = read_datetime(&mut input, False)?
+    mut shift = 0
+    match read_offset(&mut input, False)?:
+        case Some(given):
+            shift = given.seconds()
+        case Nothing:
+            pass
+    input.finish()?
+    Ok(Timestamp(local.local_seconds() - shift, local._time._nanosecond))
+
+# RFC 3339 text in UT with "Z", such as 2024-03-10T07:00:00Z.
+pub def format_timestamp(instant: &Timestamp) -> Result[str, TzError | FormatError]:
+    at = zoned(instant, &utc())?
+    Ok(f"{at._datetime}Z"?)
+
+# An RFC 9557 date-time with an offset and a zone annotation, such as
+# 2024-11-03T01:30:00-05:00[America/New_York] or ...Z[Europe/London]. The
+# annotation is a database name or an offset, optionally marked critical
+# with "!". A numeric offset must be the one the zone uses at that instant
+# (else OffsetConflict); Z gives the instant directly. Later elective
+# annotations such as [u-ca=iso8601] are ignored; a critical one is Syntax.
+pub def parse_zoned(text: &str) -> Result[Zoned, TzError | AllocError]:
+    mut input = cursor(text)?
+    local = read_datetime(&mut input, True)?
+    shift = read_offset(&mut input, True)?
+    input.expect(91)?
+    drop(input.eat(33))
+    start = input.at
+    mut zone_value = utc()
+    sign = input.peek()
+    if sign == PLUS or sign == MINUS:
+        match read_offset(&mut input, False)?:
+            case Some(named):
+                zone_value = fixed(&named)
+            case Nothing:
+                return Err(TzError.Syntax)
+    else:
+        while not input.done() and input.peek() != 93:
+            input.at += 1
+        name = input.text.slice(start, input.at)?
+        zone_value = zone(&name)?
+    input.expect(93)?
+    while input.eat(91):
+        if input.peek() == 33:
+            return Err(TzError.Syntax)
+        while not input.done() and input.peek() != 93:
+            input.at += 1
+        input.expect(93)?
+    input.finish()?
+    local_seconds = local.local_seconds()
+    match shift:
+        case Some(given):
+            seconds = local_seconds - given.seconds()
+            if period_at(&zone_value, seconds).offset != given.seconds():
+                return Err(TzError.OffsetConflict)
+            Ok(zoned_at(seconds, local._time._nanosecond, &zone_value)?)
+        case Nothing:
+            Ok(zoned_at(local_seconds, local._time._nanosecond, &zone_value)?)

@@ -1,0 +1,177 @@
+# Known transitions, gap and fold disambiguation, and zone conversion.
+import std.test
+import tz
+from std.fmt import FormatError
+from std.time import Timestamp
+
+type Problem = std.test.TestError | AllocError | FormatError | tz.TzError
+
+def at(seconds: i64) -> Timestamp:
+    Timestamp(seconds, 0u32)
+
+def text_of(value: &tz.Zoned) -> Result[str, FormatError]:
+    value.to_string()
+
+def described(offsets: &tz.LocalOffsets) -> Result[str, FormatError]:
+    match offsets:
+        case tz.LocalOffsets.Unique(only):
+            f"unique {only}"
+        case tz.LocalOffsets.Gap(before, after):
+            f"gap {before} {after}"
+        case tz.LocalOffsets.Fold(before, after):
+            f"fold {before} {after}"
+
+def resolved(zone: &tz.TimeZone, local: &tz.DateTime, how: tz.Disambiguation) -> Result[str, Problem]:
+    Ok(local.to_zoned(zone, how)?.to_string()?)
+
+def error_of[T](result: &Result[T, tz.TzError]) -> Option[tz.TzError]:
+    match result:
+        case Ok(_):
+            Nothing
+        case Err(error):
+            Some(*error)
+
+def test_new_york_2024() -> Result[(), Problem]:
+    ny = tz.zone("America/New_York")?
+    before = tz.zoned(&at(1710053999), &ny)?
+    std.test.equal(&before.to_string()?, &"2024-03-10T01:59:59-05:00[America/New_York]")?
+    std.test.equal(&before.info().abbreviation(), &"EST")?
+    after = tz.zoned(&at(1710054000), &ny)?
+    std.test.equal(&after.to_string()?, &"2024-03-10T03:00:00-04:00[America/New_York]")?
+    std.test.equal(&after.info().abbreviation(), &"EDT")?
+    std.test.check(after.info().is_dst(), "EDT is daylight saving")?
+    std.test.equal(&ny.next_transition(&at(1704067200)).unwrap().seconds, &1710054000)?
+    std.test.equal(&ny.next_transition(&at(1710054000)).unwrap().seconds, &1730613600)?
+    std.test.equal(&tz.zoned(&at(1730613600), &ny)?.to_string()?, &"2024-11-03T01:00:00-05:00[America/New_York]")?
+    Ok(())
+
+def test_spring_forward_gap() -> Result[(), Problem]:
+    ny = tz.zone("America/New_York")?
+    local = tz.datetime(2024, 3, 10, 2, 30)?
+    std.test.equal(&described(&ny.local_offsets(&local))?, &"gap -05:00 -04:00")?
+    std.test.equal(&resolved(&ny, &local, tz.Disambiguation.Compatible)?, &"2024-03-10T03:30:00-04:00[America/New_York]")?
+    std.test.equal(&resolved(&ny, &local, tz.Disambiguation.Later)?, &"2024-03-10T03:30:00-04:00[America/New_York]")?
+    std.test.equal(&resolved(&ny, &local, tz.Disambiguation.Earlier)?, &"2024-03-10T01:30:00-05:00[America/New_York]")?
+    std.test.equal(&error_of(&local.to_zoned(&ny, tz.Disambiguation.Reject)), &Some(tz.TzError.Gap))?
+    edge = tz.datetime(2024, 3, 10, 3)?
+    std.test.equal(&described(&ny.local_offsets(&edge))?, &"unique -04:00")?
+    Ok(())
+
+def test_fall_back_fold() -> Result[(), Problem]:
+    ny = tz.zone("America/New_York")?
+    local = tz.datetime(2024, 11, 3, 1, 30)?
+    std.test.equal(&described(&ny.local_offsets(&local))?, &"fold -04:00 -05:00")?
+    std.test.equal(&resolved(&ny, &local, tz.Disambiguation.Compatible)?, &"2024-11-03T01:30:00-04:00[America/New_York]")?
+    std.test.equal(&resolved(&ny, &local, tz.Disambiguation.Earlier)?, &"2024-11-03T01:30:00-04:00[America/New_York]")?
+    std.test.equal(&resolved(&ny, &local, tz.Disambiguation.Later)?, &"2024-11-03T01:30:00-05:00[America/New_York]")?
+    std.test.equal(&error_of(&local.to_zoned(&ny, tz.Disambiguation.Reject)), &Some(tz.TzError.Fold))?
+    std.test.equal(&described(&ny.local_offsets(&tz.datetime(2024, 11, 3, 2)?))?, &"unique -05:00")?
+    Ok(())
+
+def test_europe_london() -> Result[(), Problem]:
+    london = tz.zone("Europe/London")?
+    summer = tz.zoned(&tz.parse_timestamp("2024-03-31T01:00:00Z")?, &london)?
+    std.test.equal(&summer.to_string()?, &"2024-03-31T02:00:00+01:00[Europe/London]")?
+    std.test.equal(&summer.info().abbreviation(), &"BST")?
+    winter = tz.zoned(&tz.parse_timestamp("2024-10-27T01:00:00Z")?, &london)?
+    std.test.equal(&winter.to_string()?, &"2024-10-27T01:00:00+00:00[Europe/London]")?
+    std.test.equal(&winter.info().abbreviation(), &"GMT")?
+    # Local mean time before railway time in 1847.
+    old = tz.zoned(&tz.parse_timestamp("1800-01-01T00:00:00Z")?, &london)?
+    std.test.equal(&old.to_string()?, &"1799-12-31T23:58:45-00:01:15[Europe/London]")?
+    std.test.equal(&old.info().abbreviation(), &"LMT")?
+    Ok(())
+
+def test_lord_howe_half_hour_dst() -> Result[(), Problem]:
+    lord_howe = tz.zone("Australia/Lord_Howe")?
+    std.test.equal(&tz.zoned(&at(1728142199), &lord_howe)?.to_string()?, &"2024-10-06T01:59:59+10:30[Australia/Lord_Howe]")?
+    std.test.equal(&tz.zoned(&at(1728142200), &lord_howe)?.to_string()?, &"2024-10-06T02:30:00+11:00[Australia/Lord_Howe]")?
+    std.test.equal(&described(&lord_howe.local_offsets(&tz.datetime(2024, 10, 6, 2, 15)?))?, &"gap +10:30 +11:00")?
+    std.test.equal(&tz.zoned(&at(1712415600), &lord_howe)?.to_string()?, &"2024-04-07T01:30:00+10:30[Australia/Lord_Howe]")?
+    std.test.equal(&described(&lord_howe.local_offsets(&tz.datetime(2024, 4, 7, 1, 45)?))?, &"fold +11:00 +10:30")?
+    std.test.equal(&tz.zoned(&at(1712415600), &lord_howe)?.info().abbreviation(), &"+1030")?
+    Ok(())
+
+def test_apia_skips_2011_12_30() -> Result[(), Problem]:
+    apia = tz.zone("Pacific/Apia")?
+    std.test.equal(&tz.zoned(&at(1325239199), &apia)?.to_string()?, &"2011-12-29T23:59:59-10:00[Pacific/Apia]")?
+    std.test.equal(&tz.zoned(&at(1325239200), &apia)?.to_string()?, &"2011-12-31T00:00:00+14:00[Pacific/Apia]")?
+    noon = tz.datetime(2011, 12, 30, 12)?
+    std.test.equal(&described(&apia.local_offsets(&noon))?, &"gap -10:00 +14:00")?
+    std.test.equal(&error_of(&noon.to_zoned(&apia, tz.Disambiguation.Reject)), &Some(tz.TzError.Gap))?
+    # Adding a calendar day lands in the skipped day; Compatible moves the
+    # reading forward by the gap's length.
+    evening = tz.datetime(2011, 12, 29, 9)?.to_zoned(&apia, tz.Disambiguation.Reject)?
+    next_day = evening.checked_add(&tz.span(days=1), tz.Disambiguation.Compatible)?
+    std.test.equal(&next_day.to_string()?, &"2011-12-31T09:00:00+14:00[Pacific/Apia]")?
+    # The reading moves two calendar days, but only 24 hours elapse.
+    std.test.equal(&evening.span_until(&next_day).hours(), &24)?
+    Ok(())
+
+def test_kolkata() -> Result[(), Problem]:
+    kolkata = tz.zone("Asia/Kolkata")?
+    now = tz.zoned(&tz.parse_timestamp("2024-06-01T12:00:00Z")?, &kolkata)?
+    std.test.equal(&now.to_string()?, &"2024-06-01T17:30:00+05:30[Asia/Kolkata]")?
+    std.test.equal(&now.info().abbreviation(), &"IST")?
+    std.test.check(not now.info().is_dst(), "IST is standard time")?
+    std.test.check(kolkata.next_transition(&now.timestamp()).is_none(), "no transitions after 1945")?
+    # Aliases keep their own name.
+    calcutta = tz.zone("Asia/Calcutta")?
+    std.test.equal(&now.in_zone(&calcutta)?.to_string()?, &"2024-06-01T17:30:00+05:30[Asia/Calcutta]")?
+    Ok(())
+
+def test_local_mean_time() -> Result[(), Problem]:
+    ny = tz.zone("America/New_York")?
+    old = tz.zoned(&at(-3000000000), &ny)?
+    std.test.equal(&old.to_string()?, &"1874-12-07T13:43:58-04:56:02[America/New_York]")?
+    std.test.equal(&old.info().abbreviation(), &"LMT")?
+    Ok(())
+
+def test_day_versus_24_hours() -> Result[(), Problem]:
+    ny = tz.zone("America/New_York")?
+    start = tz.datetime(2024, 3, 9, 12)?.to_zoned(&ny, tz.Disambiguation.Reject)?
+    day = start.checked_add(&tz.span(days=1), tz.Disambiguation.Reject)?
+    std.test.equal(&day.to_string()?, &"2024-03-10T12:00:00-04:00[America/New_York]")?
+    std.test.equal(&start.span_until(&day).hours(), &23)?
+    hours = start.checked_add(&tz.span(hours=24), tz.Disambiguation.Reject)?
+    std.test.equal(&hours.to_string()?, &"2024-03-10T13:00:00-04:00[America/New_York]")?
+    Ok(())
+
+def test_conversion_and_fixed_offsets() -> Result[(), Problem]:
+    instant = tz.parse_timestamp("2024-07-01T12:00:00Z")?
+    tokyo = tz.zoned(&instant, &tz.zone("Asia/Tokyo")?)?
+    std.test.equal(&tokyo.to_string()?, &"2024-07-01T21:00:00+09:00[Asia/Tokyo]")?
+    std.test.equal(&tokyo.in_zone(&tz.utc())?.to_string()?, &"2024-07-01T12:00:00+00:00[UTC]")?
+    minus = tz.fixed(&tz.offset(-(3 * 3600 + 1800))?)
+    std.test.equal(&tokyo.in_zone(&minus)?.to_string()?, &"2024-07-01T08:30:00-03:30[-03:30]")?
+    std.test.check(minus.iana_name().is_none(), "fixed offsets have no name")?
+    std.test.equal(&tz.utc().info_at(&instant).abbreviation(), &"UTC")?
+    std.test.equal(&tokyo.compare(&tokyo.in_zone(&tz.utc())?), &0)?
+    std.test.equal(&error_of(&tz.offset(26 * 3600)), &Some(tz.TzError.InvalidOffset))?
+    Ok(())
+
+def test_unknown_and_case_sensitive_names() -> Result[(), Problem]:
+    std.test.equal(&error_of(&tz.zone("Mars/Olympus_Mons")), &Some(tz.TzError.UnknownZone))?
+    std.test.equal(&error_of(&tz.zone("america/new_york")), &Some(tz.TzError.UnknownZone))?
+    std.test.equal(&error_of(&tz.zone("")), &Some(tz.TzError.UnknownZone))?
+    std.test.equal(&tz.tzdata_version(), &"2026f")?
+    names = tz.zone_names().split("\n")?
+    std.test.equal(&len(names), &597)?
+    for name in names:
+        std.test.is_ok(&tz.zone(&name))?
+    Ok(())
+
+def test_zoned_round_trips() -> Result[(), Problem]:
+    for name in ["America/New_York", "Europe/London", "Australia/Lord_Howe", "Pacific/Apia", "America/Sao_Paulo"]?:
+        zone = tz.zone(&name)?
+        mut seconds = -2000000000
+        while seconds < 2200000000:
+            value = tz.zoned(&Timestamp(seconds, 123456789u32), &zone)?
+            parsed = tz.parse_zoned(&value.to_string()?)?
+            std.test.equal(&parsed.timestamp().seconds, &seconds)?
+            std.test.equal(&parsed.timestamp().nanoseconds, &123456789u32)?
+            earlier = value.datetime().to_zoned(&zone, tz.Disambiguation.Earlier)?
+            later = value.datetime().to_zoned(&zone, tz.Disambiguation.Later)?
+            std.test.check(earlier.timestamp().seconds == seconds or later.timestamp().seconds == seconds, "a wall-clock reading names its instant")?
+            seconds += 7777777
+    Ok(())

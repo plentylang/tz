@@ -1,0 +1,90 @@
+# RFC 3339 and RFC 9557 parsing and formatting.
+import std.test
+import tz
+from std.fmt import FormatError
+from std.time import Timestamp
+
+type Problem = std.test.TestError | AllocError | FormatError | tz.TzError
+
+def timestamp_error(text: &str) -> Option[tz.TzError]:
+    match tz.parse_timestamp(text):
+        case Ok(_):
+            Nothing
+        case Err(error):
+            Some(error)
+
+def zoned_error(text: &str) -> Option[tz.TzError]:
+    match tz.parse_zoned(text):
+        case Ok(_):
+            Nothing
+        case Err(failure):
+            match failure:
+                case error: tz.TzError:
+                    Some(error)
+                case _:
+                    Nothing
+
+def instant(text: &str) -> Result[(i64, u32), tz.TzError]:
+    value = tz.parse_timestamp(text)?
+    Ok((value.seconds, value.nanoseconds))
+
+def test_rfc3339_examples() -> Result[(), Problem]:
+    # The examples of RFC 3339 section 5.8.
+    std.test.equal(&instant("1985-04-12T23:20:50.52Z")?, &(482196050, 520000000u32))?
+    std.test.equal(&instant("1996-12-19T16:39:57-08:00")?, &(851042397, 0u32))?
+    std.test.equal(&instant("1937-01-01T12:00:27.87+00:20")?, &(-1041337173, 870000000u32))?
+    std.test.equal(&timestamp_error("1990-12-31T23:59:60Z"), &Some(tz.TzError.InvalidTime))?
+    Ok(())
+
+def test_rfc3339_variants() -> Result[(), Problem]:
+    std.test.equal(&instant("1985-04-12t23:20:50z")?, &(482196050, 0u32))?
+    std.test.equal(&instant("1985-04-12 23:20:50Z")?, &(482196050, 0u32))?
+    std.test.equal(&instant("1985-04-12T23:20:50-00:00")?, &(482196050, 0u32))?
+    std.test.equal(&instant("1985-04-12T23:20:50.000000001Z")?, &(482196050, 1u32))?
+    Ok(())
+
+def test_rfc3339_rejections() -> Result[(), Problem]:
+    for text in ["", "1985-04-12T23:20:50", "1985-04-12T23:20:50.Z", "1985-04-12T23:20:50.1234567890Z", "1985-4-12T23:20:50Z", "1985-04-12T3:20:50Z", "1985-04-12T23:20Z", "1985-04-12T23:20:50+0100", "1985-04-12T23:20:50Z ", "+001985-04-12T23:20:50Z", "1985-04-12_23:20:50Z", "１９８５-04-12T23:20:50Z", "1985-04-12T23:20:50+01"]?:
+        std.test.equal(&timestamp_error(&text), &Some(tz.TzError.Syntax))?
+    std.test.equal(&timestamp_error("2024-02-30T00:00:00Z"), &Some(tz.TzError.InvalidDate))?
+    std.test.equal(&timestamp_error("2024-13-01T00:00:00Z"), &Some(tz.TzError.InvalidDate))?
+    std.test.equal(&timestamp_error("2024-01-01T24:00:00Z"), &Some(tz.TzError.InvalidTime))?
+    std.test.equal(&timestamp_error("2024-01-01T00:00:00+24:00"), &Some(tz.TzError.InvalidOffset))?
+    std.test.equal(&timestamp_error("2024-01-01T00:00:00+05:60"), &Some(tz.TzError.InvalidOffset))?
+    Ok(())
+
+def test_format_timestamp() -> Result[(), Problem]:
+    std.test.equal(&tz.format_timestamp(&Timestamp(482196050, 520000000u32))?, &"1985-04-12T23:20:50.52Z")?
+    std.test.equal(&tz.format_timestamp(&Timestamp(0, 0u32))?, &"1970-01-01T00:00:00Z")?
+    std.test.equal(&tz.format_timestamp(&Timestamp(-1, 999999999u32))?, &"1969-12-31T23:59:59.999999999Z")?
+    Ok(())
+
+def test_civil_parsing() -> Result[(), Problem]:
+    std.test.equal(&tz.parse_date("2024-02-29")?.to_string()?, &"2024-02-29")?
+    std.test.equal(&tz.parse_date("-000001-03-01")?.year(), &-1)?
+    std.test.equal(&tz.parse_date("+009999-12-31")?.to_string()?, &"9999-12-31")?
+    std.test.is_err(&tz.parse_date("-000000-01-01"))?
+    std.test.is_err(&tz.parse_date("+010000-01-01"))?
+    std.test.equal(&tz.parse_time("07:05:00.250")?.to_string()?, &"07:05:00.25")?
+    std.test.equal(&tz.parse_datetime("2024-03-10T02:30:00")?.to_string()?, &"2024-03-10T02:30:00")?
+    std.test.equal(&tz.parse_offset("-04:56:02")?.seconds(), &-17762)?
+    std.test.is_err(&tz.parse_offset("Z"))?
+    Ok(())
+
+def test_zoned_parsing() -> Result[(), Problem]:
+    later = tz.parse_zoned("2024-11-03T01:30:00-05:00[America/New_York]")?
+    std.test.equal(&later.timestamp().seconds, &1730615400)?
+    earlier = tz.parse_zoned("2024-11-03T01:30:00-04:00[America/New_York]")?
+    std.test.equal(&earlier.timestamp().seconds, &1730611800)?
+    utc = tz.parse_zoned("2024-11-03T06:30:00Z[America/New_York]")?
+    std.test.equal(&utc.to_string()?, &"2024-11-03T01:30:00-05:00[America/New_York]")?
+    std.test.equal(&tz.parse_zoned("2024-11-03T01:30:00-05:00[!America/New_York][u-ca=iso8601]")?.timestamp().seconds, &1730615400)?
+    std.test.equal(&tz.parse_zoned("2024-06-01T17:30:00+05:30[+05:30]")?.to_string()?, &"2024-06-01T17:30:00+05:30[+05:30]")?
+    std.test.equal(&tz.parse_zoned("2024-06-01T12:00:00+00:00[UTC]")?.to_string()?, &"2024-06-01T12:00:00+00:00[UTC]")?
+    std.test.equal(&zoned_error("2024-11-03T01:30:00-06:00[America/New_York]"), &Some(tz.TzError.OffsetConflict))?
+    std.test.equal(&zoned_error("2024-03-10T02:30:00-05:00[America/New_York]"), &Some(tz.TzError.OffsetConflict))?
+    std.test.equal(&zoned_error("2024-11-03T01:30:00-05:00[America/New_York][!u-ca=iso8601]"), &Some(tz.TzError.Syntax))?
+    std.test.equal(&zoned_error("2024-11-03T01:30:00-05:00"), &Some(tz.TzError.Syntax))?
+    std.test.equal(&zoned_error("2024-11-03T01:30:00-05:00[America/New_York"), &Some(tz.TzError.Syntax))?
+    std.test.equal(&zoned_error("2024-11-03T01:30:00-05:00[Mars/Olympus_Mons]"), &Some(tz.TzError.UnknownZone))?
+    Ok(())

@@ -1,0 +1,45 @@
+# Checks every zone against `zdump -v` output from the pinned tzcode, built
+# by scripts/generate.py: each line is an instant just before or at a
+# transition with the offset, daylight-saving flag, and abbreviation zdump
+# reports there.
+import std.test
+import tz
+from std.fmt import FormatError
+from std.time import Timestamp
+
+const VECTORS: str = include_str("data/zdump.txt")
+
+def check_vector(zone: &tz.TimeZone, line: &str) -> Result[(), std.test.TestError | AllocError | ParseError | FormatError | tz.TzError]:
+    fields = line.split(" ")?
+    instant = Timestamp(i64.parse(fields[0])?, 0u32)
+    expected_offset = i64.parse(fields[1])?
+    info = zone.info_at(&instant)
+    if info.offset().seconds() != expected_offset or info.is_dst() != (fields[2] == "1") or info.abbreviation() != fields[3]:
+        std.test.fail(f"{zone.iana_name().unwrap()} at {fields[0]}: got {info.offset()} dst={info.is_dst()} {info.abbreviation()}, expected {line}"?)?
+    # The wall-clock reading of the instant must name it again under one of
+    # the offsets the zone allows there.
+    at = tz.zoned(&instant, zone)?
+    match zone.local_offsets(&at.datetime()):
+        case tz.LocalOffsets.Unique(only):
+            std.test.equal(&only.seconds(), &expected_offset)?
+        case tz.LocalOffsets.Fold(before, after):
+            std.test.check(before.seconds() == expected_offset or after.seconds() == expected_offset, "fold offsets")?
+        case tz.LocalOffsets.Gap(_, _):
+            std.test.fail(f"{line}: reading of an instant reported as a gap"?)?
+    Ok(())
+
+def test_zdump_vectors() -> Result[(), std.test.TestError | AllocError | ParseError | FormatError | tz.TzError]:
+    mut zone = tz.utc()
+    mut vectors = 0
+    mut zones = 0
+    for line in VECTORS.splitlines()?:
+        if line.startswith("#"):
+            continue
+        if line.startswith("Z "):
+            zone = tz.zone(&line.slice(2, line.byte_len())?)?
+            zones += 1
+            continue
+        check_vector(&zone, &line)?
+        vectors += 1
+    std.test.equal(&zones, &316)?
+    std.test.check(vectors > 40000, "vector count")

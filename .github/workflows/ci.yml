@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PLENTY_VERSION: "0.7.1"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Plenty
+        run: |
+          archive="plenty-${PLENTY_VERSION}-x86_64-unknown-linux-gnu"
+          base="https://github.com/cjrh/plenty/releases/download/v${PLENTY_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "$base/$archive.tar.gz"
+          curl -fsSLO "$base/$archive.tar.gz.sha256"
+          sha256sum -c "$archive.tar.gz.sha256"
+          tar -xzf "$archive.tar.gz"
+          echo "$RUNNER_TEMP/$archive/bin" >> "$GITHUB_PATH"
+      - run: plenty --version
+      - run: plenty check --locked
+      - run: plenty test --locked

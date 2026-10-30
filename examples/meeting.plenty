@@ -1,0 +1,12 @@
+import tz
+from std.fmt import FormatError
+
+def main() -> Result[(), tz.TzError | FormatError | AllocError | IoError]:
+    new_york = tz.zone("America/New_York")?
+    london = tz.zone("Europe/London")?
+    meeting = tz.datetime(2024, 3, 9, 9, 30)?.to_zoned(&new_york, tz.Disambiguation.Reject)?
+    next_week = meeting.checked_add(&tz.span(weeks=1), tz.Disambiguation.Reject)?
+    print(f"{next_week}"?)?
+    print(f"{next_week.in_zone(&london)?}"?)?
+    print(meeting.span_until(&next_week).hours())?
+    Ok(())
