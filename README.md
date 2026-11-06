@@ -16,7 +16,7 @@ Add the dependency to `plenty.toml`, then run `plenty fetch`:
 
 ```toml
 [dependencies]
-tz = { git = "https://github.com/plentylang/tz.git", tag = "v0.3.0" }
+tz = { git = "https://github.com/plentylang/tz.git", tag = "v0.4.0" }
 ```
 
 It needs Plenty 0.8.10 or later.
