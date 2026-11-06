@@ -260,7 +260,9 @@ def plenty_string(text: str) -> str:
 
 LOOKUP = """\
 def index_field(entry: i64, at: i64) -> i64:
-    (i64(NAME_INDEX[4 * entry + at]) << 8) | i64(NAME_INDEX[4 * entry + at + 1])
+    # Generated table indices and 32-bit hash products fit i64.
+    unchecked trap:
+        (i64(NAME_INDEX[4 * entry + at]) << 8) | i64(NAME_INDEX[4 * entry + at + 1])
 
 # NAMES and the names looked up are ASCII, so scalar positions are bytes.
 def code(text: &str, at: i64) -> i64:
@@ -273,38 +275,42 @@ def code(text: &str, at: i64) -> i64:
 # -1, 0, or 1 as the name at NAMES[start:stop] sorts before, equal to, or
 # after `name`.
 def compare_name(start: i64, stop: i64, name: &str) -> i64:
-    length = name.byte_len()
-    mut at = 0
-    while start + at < stop and at < length:
-        left = code(&NAMES, start + at)
-        right = code(name, at)
-        if left != right:
-            return -1 if left < right else 1
-        at += 1
-    # One is a prefix of the other: the shorter sorts first.
-    if stop - start == length:
-        0
-    elif stop - start < length:
-        -1
-    else:
-        1
+    # Generated table indices and 32-bit hash products fit i64.
+    unchecked trap:
+        length = name.byte_len()
+        mut at = 0
+        while start + at < stop and at < length:
+            left = code(&NAMES, start + at)
+            right = code(name, at)
+            if left != right:
+                return -1 if left < right else 1
+            at += 1
+        # One is a prefix of the other: the shorter sorts first.
+        if stop - start == length:
+            0
+        elif stop - start < length:
+            -1
+        else:
+            1
 
 # The number of the zone a canonical name or link names, or -1.
 def find(name: &str) -> i64:
-    if not name.isascii():
-        return -1
-    mut low = 0
-    mut high = NAME_COUNT
-    while low < high:
-        middle = low + (high - low) // 2
-        order = compare_name(index_field(middle, 0), index_field(middle + 1, 0) - 1, name)
-        if order == 0:
-            return index_field(middle, 2)
-        if order < 0:
-            low = middle + 1
-        else:
-            high = middle
-    -1
+    # Generated table indices and 32-bit hash products fit i64.
+    unchecked trap:
+        if not name.isascii():
+            return -1
+        mut low = 0
+        mut high = NAME_COUNT
+        while low < high:
+            middle = low + (high - low) // 2
+            order = compare_name(index_field(middle, 0), index_field(middle + 1, 0) - 1, name)
+            if order == 0:
+                return index_field(middle, 2)
+            if order < 0:
+                low = middle + 1
+            else:
+                high = middle
+        -1
 
 # The data of the zone a canonical name or link names.
 pub def lookup(name: &str) -> Option[bytes]:
@@ -316,21 +322,25 @@ pub def lookup(name: &str) -> Option[bytes]:
 
 # 32-bit FNV-1a.
 def fnv(data: &bytes) -> i64:
-    mut hash = 2166136261
-    for byte in data:
-        hash = ((hash ^ i64(*byte)) * 16777619) & 4294967295
-    hash
+    # Generated table indices and 32-bit hash products fit i64.
+    unchecked trap:
+        mut hash = 2166136261
+        for byte in data:
+            hash = ((hash ^ i64(*byte)) * 16777619) & 4294967295
+        hash
 
 # Whether `data` is the bundled data of the zone `name` names. This reads
 # only the name index and one hash, so it links no zone data.
 pub def is_bundled(name: &str, data: &bytes) -> bool:
-    number = find(name)
-    if number < 0:
-        return False
-    mut stored = 0
-    for part in range(4):
-        stored = (stored << 8) | i64(ZONE_HASHES[4 * number + part])
-    fnv(data) == stored"""
+    # Generated table indices and 32-bit hash products fit i64.
+    unchecked trap:
+        number = find(name)
+        if number < 0:
+            return False
+        mut stored = 0
+        for part in range(4):
+            stored = (stored << 8) | i64(ZONE_HASHES[4 * number + part])
+        fnv(data) == stored"""
 
 
 def fnv(data: bytes) -> int:

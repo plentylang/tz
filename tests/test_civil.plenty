@@ -3,7 +3,7 @@ import std.test
 import tz
 from std.fmt import FormatError
 
-type Problem = std.test.TestError | AllocError | FormatError | tz.TzError
+type Problem = OverflowError[i64] | std.test.TestError | AllocError | FormatError | tz.TzError
 
 def error_of[T](result: &Result[T, tz.TzError]) -> Option[tz.TzError]:
     match result:
@@ -99,4 +99,43 @@ def test_epoch_day_round_trips() -> Result[(), Problem]:
         std.test.equal(&tz.parse_date(&value.to_string()?)?.epoch_day(), &day)?
         day += 997
     std.test.equal(&error_of(&tz.date_from_epoch_day(2932897)), &Some(tz.TzError.OutOfRange))?
+    Ok(())
+
+# Expected endpoints use exact elapsed nanoseconds, including day/second carry.
+def test_nanosecond_addition_boundaries() -> Result[(), Problem]:
+    how = tz.Disambiguation.Reject
+    for start_text, nanos, end_text in [
+        ("1970-01-01T12:00:00", -1, "1970-01-01T11:59:59.999999999"),
+        ("1970-01-01T00:00:00.000000001", i64.MAX, "2262-04-11T23:47:16.854775808"),
+        ("1970-01-01T00:00:00.000000001", i64.MIN, "1677-09-21T00:12:43.145224193"),
+        ("1970-01-01T23:59:59.999999999", i64.MAX, "2262-04-12T23:47:16.854775806"),
+        ("1970-01-01T23:59:59.999999999", i64.MIN, "1677-09-22T00:12:43.145224191"),
+    ]?:
+        start = tz.parse_datetime(&start_text)?
+        end = tz.parse_datetime(&end_text)?
+        std.test.equal(&start.checked_add(&tz.span(nanoseconds=nanos))?.compare(&end), &0)?
+        zoned_start = start.to_zoned(&tz.utc(), how)?
+        zoned_end = end.to_zoned(&tz.utc(), how)?
+        delta = zoned_start.until(&zoned_end, tz.Unit.Nanosecond, how)?
+        std.test.equal(&delta.nanoseconds(), &nanos)?
+        std.test.equal(&zoned_start.checked_add(&delta, how)?.compare(&zoned_end), &0)?
+    Ok(())
+
+def test_nanosecond_addition_range_errors() -> Result[(), Problem]:
+    how = tz.Disambiguation.Reject
+    for start_text, nanos in [
+        ("9999-12-31T23:59:59.999999999", 1),
+        ("-009999-01-01T00:00:00", -1),
+    ]?:
+        start = tz.parse_datetime(&start_text)?
+        std.test.equal(&error_of(&start.checked_add(&tz.span(nanoseconds=nanos))), &Some(tz.TzError.OutOfRange))?
+        zoned = start.to_zoned(&tz.utc(), how)?
+        std.test.equal(&error_of(&zoned.checked_add(&tz.span(nanoseconds=nanos), how)), &Some(tz.TzError.OutOfRange))?
+    # Splitting the clock addition must not bypass span validation.
+    start = tz.datetime(1970, 1, 1)?
+    zoned = start.to_zoned(&tz.utc(), how)?
+    for seconds, nanos in [(1, i64.MAX), (-1, i64.MIN)]?:
+        delta = tz.span(seconds=seconds, nanoseconds=nanos)
+        std.test.equal(&error_of(&start.checked_add(&delta)), &Some(tz.TzError.OutOfRange))?
+        std.test.equal(&error_of(&zoned.checked_add(&delta, how)), &Some(tz.TzError.OutOfRange))?
     Ok(())

@@ -19,7 +19,7 @@ Add the dependency to `plenty.toml`, then run `plenty fetch`:
 tz = { git = "https://github.com/plentylang/tz.git", tag = "v0.3.0" }
 ```
 
-It needs Plenty 0.7.1 or later.
+It needs Plenty 0.8.10 or later.
 
 ## Example
 
@@ -49,6 +49,10 @@ def main() -> Result[(), tz.TzError | FormatError | AllocError | IoError]:
 A week later is the same wall-clock time, but only 167 hours later: New York
 moved its clocks forward on 10 March. `tests/test_example.plenty` checks this
 output.
+
+Formatting to a string returns `AllocError | FormatError`;
+`format_timestamp` also returns `TzError`. Span arithmetic that exceeds
+its representable range returns `TzError.OutOfRange`.
 
 ## API
 
