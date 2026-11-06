@@ -452,13 +452,14 @@ pub class DateTime:
     # smaller units move the clock, carrying whole days. With no zone, every
     # day here is 24 hours: use Zoned.checked_add for elapsed time.
     pub def checked_add(self, span: &Span) -> Result[DateTime, TzError]:
-        # Unbounded nanosecond addition uses sum_in_range; remaining date arithmetic is bounded.
+        # Split the span before adding the clock: two day remainders fit in i64.
         unchecked trap:
             moved = calendar_added(&self._date, span)?
-            nanos = sum_in_range(self._time.nanosecond_of_day(), span.time_nanoseconds()?)?
-            days = nanos // NANOS_PER_DAY
+            total = span.time_nanoseconds()?
+            nanos = self._time.nanosecond_of_day() + total % NANOS_PER_DAY
+            days = total // NANOS_PER_DAY + nanos // NANOS_PER_DAY
             if days == 0:
-                return Ok(DateTime(moved, time_from_nanosecond_of_day(nanos)))
+                return Ok(DateTime(moved, time_from_nanosecond_of_day(nanos % NANOS_PER_DAY)))
             shifted = date_from_epoch_day(moved.epoch_day() + days)?
             Ok(DateTime(shifted, time_from_nanosecond_of_day(nanos % NANOS_PER_DAY)))
 
@@ -557,16 +558,6 @@ pub class Span:
             if (self._nanoseconds > 0 and nanos > i64.MAX - self._nanoseconds) or (self._nanoseconds < 0 and nanos < i64.MIN - self._nanoseconds):
                 return Err(TzError.OutOfRange)
             Ok(nanos + self._nanoseconds)
-
-# Preserve the package's range-error contract for caller-supplied spans.
-def sum_in_range(left: i64, right: i64) -> Result[i64, TzError]:
-    result = checked:
-        left + right
-    match result:
-        case Ok(value):
-            Ok(value)
-        case Err(_):
-            Err(TzError.OutOfRange)
 
 def negate_in_range(value: i64) -> Result[i64, TzError]:
     result = checked:
@@ -1035,14 +1026,16 @@ pub class Zoned:
     # so adding 24 hours across a daylight-saving change differs from adding
     # one day.
     pub def checked_add(self, span: &Span, disambiguation: Disambiguation) -> Result[Zoned, TzError]:
-        # Unbounded nanosecond addition uses sum_in_range; remaining date arithmetic is bounded.
+        # Split the span before adding the fraction: two second remainders fit in i64.
+        # Supported epoch seconds plus at most 292 years also fit in i64.
         unchecked trap:
             mut seconds = self._seconds
             if span.has_calendar_units():
                 moved = DateTime(calendar_added(&self._datetime._date, span)?, self._datetime._time)
                 seconds = resolved(&self._zone, &moved, disambiguation)?
-            nanos = sum_in_range(i64(self._nanosecond), span.time_nanoseconds()?)?
-            whole = seconds + nanos // NANOS_PER_SECOND
+            total = span.time_nanoseconds()?
+            nanos = i64(self._nanosecond) + total % NANOS_PER_SECOND
+            whole = seconds + total // NANOS_PER_SECOND + nanos // NANOS_PER_SECOND
             zoned_at(whole, u32(nanos % NANOS_PER_SECOND), &self._zone)
 
     # The exact elapsed time to `other` in hours, minutes, seconds, and
