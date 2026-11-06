@@ -5,15 +5,15 @@ import tz.tzdb as tzdb
 from std.fmt import FormatError
 from std.time import Timestamp
 
-type Problem = std.test.TestError | AllocError | FormatError | tz.TzError
+type Problem = OverflowError[i64] | std.test.TestError | AllocError | FormatError | tz.TzError
 
 def at(seconds: i64) -> Timestamp:
     Timestamp(seconds, 0u32)
 
-def text_of(value: &tz.Zoned) -> Result[str, FormatError]:
+def text_of(value: &tz.Zoned) -> Result[str, AllocError | FormatError]:
     value.to_string()
 
-def described(offsets: &tz.LocalOffsets) -> Result[str, FormatError]:
+def described(offsets: &tz.LocalOffsets) -> Result[str, AllocError | FormatError]:
     match offsets:
         case tz.LocalOffsets.Unique(only):
             f"unique {only}"

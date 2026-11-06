@@ -28,7 +28,7 @@ def check_vector(zone: &tz.TimeZone, line: &str) -> Result[(), std.test.TestErro
             std.test.fail(f"{line}: reading of an instant reported as a gap"?)?
     Ok(())
 
-def test_zdump_vectors() -> Result[(), std.test.TestError | AllocError | ParseError | FormatError | tz.TzError]:
+def test_zdump_vectors() -> Result[(), std.test.TestError | AllocError | ParseError | FormatError | tz.TzError | OverflowError[i64]]:
     mut zone = tz.utc()
     mut vectors = 0
     mut zones = 0

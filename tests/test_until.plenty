@@ -140,6 +140,7 @@ def test_range_limits() -> Result[(), Problem]:
     std.test.equal(&error_of(&epoch.until(&beyond, tz.Unit.Nanosecond, how)), &Some(tz.TzError.OutOfRange))?
     first = zoned(&"1677-09-21T00:12:43.145224192+00:00[UTC]")?
     std.test.equal(&fields(&epoch.until(&first, tz.Unit.Nanosecond, how)?), &(0, 0, 0, 0, 0, 0, 0, i64.MIN))?
+    std.test.equal(&error_of(&epoch.since(&first, tz.Unit.Nanosecond, how)), &Some(tz.TzError.OutOfRange))?
     # The widest supported range fits every other unit.
     low = zoned(&"-009999-01-01T00:00:00+00:00[UTC]")?
     high = zoned(&"9999-12-31T23:59:59.999999999+00:00[UTC]")?

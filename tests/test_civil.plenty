@@ -3,7 +3,7 @@ import std.test
 import tz
 from std.fmt import FormatError
 
-type Problem = std.test.TestError | AllocError | FormatError | tz.TzError
+type Problem = OverflowError[i64] | std.test.TestError | AllocError | FormatError | tz.TzError
 
 def error_of[T](result: &Result[T, tz.TzError]) -> Option[tz.TzError]:
     match result:
@@ -99,4 +99,12 @@ def test_epoch_day_round_trips() -> Result[(), Problem]:
         std.test.equal(&tz.parse_date(&value.to_string()?)?.epoch_day(), &day)?
         day += 997
     std.test.equal(&error_of(&tz.date_from_epoch_day(2932897)), &Some(tz.TzError.OutOfRange))?
+    Ok(())
+
+# The clock's nanoseconds must not overflow when added to an arbitrary span.
+def test_nanosecond_addition_overflow() -> Result[(), Problem]:
+    start = tz.datetime(2024, 1, 1, nanosecond=1)?
+    std.test.equal(&error_of(&start.checked_add(&tz.span(nanoseconds=i64.MAX))), &Some(tz.TzError.OutOfRange))?
+    zoned = start.to_zoned(&tz.utc(), tz.Disambiguation.Reject)?
+    std.test.equal(&error_of(&zoned.checked_add(&tz.span(nanoseconds=i64.MAX), tz.Disambiguation.Reject)), &Some(tz.TzError.OutOfRange))?
     Ok(())

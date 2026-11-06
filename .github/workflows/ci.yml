@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  PLENTY_VERSION: "0.7.1"
+  PLENTY_VERSION: "0.8.10"
 
 jobs:
   test:
